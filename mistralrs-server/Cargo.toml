@@ -12,6 +12,9 @@ license.workspace = true
 homepage.workspace = true
 default-run = "mistralrs-server"
 
+[lib]
+path = "src/lib.rs"
+
 [dependencies]
 anyhow.workspace = true
 axum = { workspace = true, features = ["tokio"] }
