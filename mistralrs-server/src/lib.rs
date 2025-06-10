@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsString;
 use anyhow::Result;
 use clap::Parser;
 use mistralrs_core::{initialize_logging, ModelSelected, TokenSource};
@@ -14,6 +15,7 @@ use interactive_mode::interactive_mode;
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
+#[derive(Debug)]
 struct Args {
     /// IP to serve on. Defaults to "0.0.0.0"
     #[arg(long)]
@@ -142,14 +144,16 @@ fn parse_token_source(s: &str) -> Result<TokenSource, String> {
 }
 
 //#[tokio::main]
-pub async fn start() -> Result<()> {
+pub async fn start(run_args: Vec<OsString>) -> Result<()> {
 
-    let mut env_args: Vec<_> = env::args_os().collect();
-    env_args.remove(1);
-    env_args.remove(1);
-    //args.remove(1);
-    let args = Args::parse_from(env_args.drain(..));
-
+    // let mut env_args: Vec<_> = env::args_os().collect();
+    // env_args.remove(1);
+    // env_args.remove(1);
+    // println!("{:?}", env_args);
+    // let args = Args::parse_from(env_args.drain(..));
+    println!("{:?}", run_args);
+    let args = Args::try_parse_from(run_args)?;
+    println!("{:?}", args);
     //initialize_logging();
 
     let mistralrs = MistralRsForServerBuilder::new()
