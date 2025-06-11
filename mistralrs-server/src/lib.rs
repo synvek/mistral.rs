@@ -1,7 +1,11 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
+use tokio::time::sleep;
 use mistralrs_core::{initialize_logging, ModelSelected, TokenSource};
 use tracing::info;
 
@@ -139,22 +143,72 @@ struct Args {
     enable_thinking: bool,
 }
 
+#[derive(Debug, Clone, )]
+pub struct ModelInfo {
+    pub model_id: String,
+    pub path: String,
+}
+
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
     s.parse()
 }
 
+
+static GLOBAL_LOCKS: OnceLock<Arc<Mutex<HashMap<String, ModelInfo>>>> = OnceLock::new();
+
+
+async fn shutdown_signal(task_id: String) {
+    loop {
+        sleep(Duration::from_secs(1)).await;
+        let map_ref = Arc::clone(GLOBAL_LOCKS.get().unwrap());
+        let mut map = map_ref.lock().unwrap();
+        if !map.contains_key(&task_id) {
+            info!("Shutting down by signal for {}...", task_id);
+            break;
+        }
+    }
+}
+
+fn init_map() -> Arc<Mutex<HashMap<String, ModelInfo>>> {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+fn insert_lock(key: String, value:ModelInfo) {
+    let map_ref = Arc::clone(GLOBAL_LOCKS.get().unwrap());
+    let mut map = map_ref.lock().unwrap();
+    map.insert(key, value);
+}
+
+pub fn initialize_server() {
+    GLOBAL_LOCKS.get_or_init(|| init_map());
+}
+
+pub fn stop_server(task_id: String) {
+    let map_ref = Arc::clone(GLOBAL_LOCKS.get().unwrap());
+    let mut map = map_ref.lock().unwrap();
+    map.remove(&task_id);
+}
+
+pub fn get_servers()->Vec<ModelInfo> {
+    let map_ref = Arc::clone(GLOBAL_LOCKS.get().unwrap());
+    let mut map = map_ref.lock().unwrap();
+    map.values().cloned().collect::<Vec<_>>()
+}
+
 //#[tokio::main]
-pub async fn start(run_args: Vec<OsString>) -> Result<()> {
+pub async fn start_server(task_id: String, run_args: Vec<OsString>, model_info: ModelInfo) -> Result<()> {
 
     // let mut env_args: Vec<_> = env::args_os().collect();
     // env_args.remove(1);
     // env_args.remove(1);
     // println!("{:?}", env_args);
     // let args = Args::parse_from(env_args.drain(..));
-    println!("{:?}", run_args);
+    // println!("{:?}", run_args);
     let args = Args::try_parse_from(run_args)?;
-    println!("{:?}", args);
+    // println!("{:?}", args);
     //initialize_logging();
+    info!("Starting server with signal {}...", task_id);
+    insert_lock(task_id.clone(), model_info);
 
     let mistralrs = MistralRsForServerBuilder::new()
         .with_truncate_sequence(args.truncate_sequence)
@@ -214,7 +268,7 @@ pub async fn start(run_args: Vec<OsString>) -> Result<()> {
 
     if let Some((listener, ip, port)) = setting_server {
         info!("Serving on http://{ip}:{}.", port);
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(task_id)).await?;
     };
 
     Ok(())
