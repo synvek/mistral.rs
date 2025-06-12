@@ -145,8 +145,26 @@ struct Args {
 
 #[derive(Debug, Clone, )]
 pub struct ModelInfo {
+    /// task id
+    pub task_id: String,
+
+    /// port
+    pub port: String,
+
+    /// If server started
+    pub started: bool,
+
+    /// in_situ_quant
+    pub isq: String,
+
+    /// Model
     pub model_id: String,
-    pub path: String,
+
+    /// Model
+    pub model_type: String,
+
+    /// Model Path
+    pub path: String
 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
@@ -193,6 +211,12 @@ pub fn get_servers()->Vec<ModelInfo> {
     let map_ref = Arc::clone(GLOBAL_LOCKS.get().unwrap());
     let mut map = map_ref.lock().unwrap();
     map.values().cloned().collect::<Vec<_>>()
+}
+
+pub fn get_server(task_id: String) -> Option<ModelInfo> {
+    let map_ref = Arc::clone(GLOBAL_LOCKS.get().unwrap());
+    let mut map = map_ref.lock().unwrap();
+    map.get(&task_id).cloned()
 }
 
 //#[tokio::main]
@@ -265,6 +289,14 @@ pub async fn start_server(task_id: String, run_args: Vec<OsString>, model_info: 
         .with_mistralrs(mistralrs)
         .build()
         .await?;
+
+    let model_info = get_server(task_id.clone());
+
+    if model_info.is_some() {
+        let mut new_model_info = model_info.unwrap();
+        new_model_info.started = true;
+        insert_lock(task_id.clone(), new_model_info);
+    }
 
     if let Some((listener, ip, port)) = setting_server {
         info!("Serving on http://{ip}:{}.", port);
