@@ -145,6 +145,9 @@ struct Args {
 
 #[derive(Debug, Clone, )]
 pub struct ModelInfo {
+    /// Model Name： Local Model Identifier
+    pub model_name: String,
+
     /// task id
     pub task_id: String,
 
