@@ -158,7 +158,7 @@ pub struct ModelInfo {
     pub started: bool,
 
     /// in_situ_quant
-    pub isq: String,
+    pub isq: Option<String>,
 
     /// Model
     pub model_id: String,
