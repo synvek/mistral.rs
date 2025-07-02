@@ -2756,6 +2756,7 @@ dependencies = [
  "ctrlc",
  "directories 6.0.0",
  "either",
+ "hf-hub",
  "indexmap",
  "mistralrs-core",
  "mistralrs-server-core",

@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
+use hf_hub::Cache;
 use tokio::time::sleep;
-use mistralrs_core::{initialize_logging, ModelSelected, TokenSource};
+use mistralrs_core::{initialize_logging, ModelSelected, TokenSource, GLOBAL_HF_CACHE, GLOBAL_HF_ENDPOINT};
 use tracing::info;
 
 use mistralrs_server_core::{
@@ -202,6 +203,13 @@ fn insert_lock(key: String, value:ModelInfo) {
 
 pub fn initialize_server() {
     GLOBAL_LOCKS.get_or_init(|| init_map());
+    let path = std::path::PathBuf::from("C:/source/works/huan/engine/models");
+    let cache = Cache::new(path);
+    let end_point = "https://hf-mirror.com".to_string();
+    GLOBAL_HF_CACHE.get_or_init(|| cache.clone());
+    GLOBAL_HF_ENDPOINT.get_or_init(|| end_point.clone());
+    println!("Check cache path = {}", cache.path().display().to_string());
+    println!("Check end point = {}", end_point.to_string());
 }
 
 pub fn stop_server(task_id: String) {

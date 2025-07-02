@@ -2,7 +2,8 @@ use std::{cmp::Ordering, fs::File, sync::Arc};
 
 use candle_core::{DType, Device, Result, Tensor, D};
 use candle_nn::Module;
-use hf_hub::api::sync::{Api, ApiError};
+use hf_hub::api::sync::{Api, ApiBuilder, ApiError};
+use hf_hub::Cache;
 use mistralrs_quant::ShardedVarBuilder;
 use tokenizers::Tokenizer;
 use tracing::info;
@@ -171,7 +172,14 @@ impl FluxStepper {
         silent: bool,
         offloaded: bool,
     ) -> anyhow::Result<Self> {
-        let api = Api::new()?;
+        // Tronai patch: activate cache & endpoint
+        use crate::GLOBAL_HF_CACHE;
+        use crate::GLOBAL_HF_ENDPOINT;
+        let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
+        let endpoint = GLOBAL_HF_ENDPOINT.get().cloned().unwrap_or_default();
+        let api_builder = ApiBuilder::from_cache(cache).with_endpoint(endpoint);
+        let api = api_builder.build()?;
+        //let api = Api::new()?;
 
         info!("Loading T5 XXL tokenizer.");
         let t5_tokenizer = get_t5_tokenizer(&api)?;

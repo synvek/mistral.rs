@@ -139,15 +139,20 @@ impl NormalLoaderBuilder {
         no_kv_cache: bool,
         jinja_explicit: Option<String>,
     ) -> Self {
+        // Tronai patch: activate cache path here
         Self {
-            config,
+            config: config.clone(),
+            xlora_model_id: None,
             chat_template,
             tokenizer_json,
             model_id,
             kind: ModelKind::Normal,
             jinja_explicit,
             no_kv_cache,
-            ..Default::default()
+            lora_adapter_ids: None,
+            xlora_order: None,
+            tgt_non_granular_index: None,
+            hf_cache_path: config.clone().hf_cache_path,
         }
     }
 

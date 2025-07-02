@@ -124,6 +124,8 @@ pub use llguidance;
 /// `true` if `MISTRALRS_DEBUG=1`
 pub(crate) static DEBUG: AtomicBool = AtomicBool::new(false);
 pub static GLOBAL_HF_CACHE: OnceLock<Cache> = OnceLock::new();
+// Tronai Patch: add endpoint here
+pub static GLOBAL_HF_ENDPOINT: OnceLock<String> = OnceLock::new();
 static ENGINE_ID: AtomicUsize = AtomicUsize::new(0);
 
 pub struct MistralRsConfig {

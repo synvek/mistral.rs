@@ -69,9 +69,13 @@ macro_rules! get_paths {
         let api = {
             use $crate::GLOBAL_HF_CACHE;
             let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
+            // Tronai patch: activate endpoint
+            use $crate::GLOBAL_HF_ENDPOINT;
+            let endpoint = GLOBAL_HF_ENDPOINT.get().cloned().unwrap_or_default();
             let mut api = ApiBuilder::from_cache(cache)
                 .with_progress(!$silent)
-                .with_token(get_token($token_source)?);
+                .with_token(get_token($token_source)?)
+                .with_endpoint(endpoint);
             if let Ok(x) = std::env::var("HF_HUB_CACHE") {
                 api = api.with_cache_dir(x.into());
             }

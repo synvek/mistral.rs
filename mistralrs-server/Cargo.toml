@@ -26,6 +26,7 @@ indexmap.workspace = true
 mistralrs-core = { version = "0.6.0", path = "../mistralrs-core" }
 mistralrs-server-core = { version = "0.6.0", path = "../mistralrs-server-core" }
 once_cell.workspace = true
+hf-hub.workspace = true
 regex.workspace = true
 rustyline = { version = "15.0.0", default-features = false, features = [
   "with-file-history",
