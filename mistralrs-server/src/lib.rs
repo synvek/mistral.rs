@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use anyhow::Result;
@@ -201,15 +202,15 @@ fn insert_lock(key: String, value:ModelInfo) {
     map.insert(key, value);
 }
 
-pub fn initialize_server() {
+pub fn initialize_server(model_dir: PathBuf, endpoint: String) {
     GLOBAL_LOCKS.get_or_init(|| init_map());
-    let path = std::path::PathBuf::from("C:/source/works/huan/engine/models");
-    let cache = Cache::new(path);
-    let end_point = "https://hf-mirror.com".to_string();
+    //let path = std::path::PathBuf::from("C:/source/works/huan/engine/models");
+    let cache = Cache::new(model_dir);
+    //let end_point = "https://hf-mirror.com".to_string();
     GLOBAL_HF_CACHE.get_or_init(|| cache.clone());
-    GLOBAL_HF_ENDPOINT.get_or_init(|| end_point.clone());
+    GLOBAL_HF_ENDPOINT.get_or_init(|| endpoint.clone());
     println!("Check cache path = {}", cache.path().display().to_string());
-    println!("Check end point = {}", end_point.to_string());
+    println!("Check end point = {}", endpoint.to_string());
 }
 
 pub fn stop_server(task_id: String) {
