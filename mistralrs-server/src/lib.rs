@@ -169,7 +169,10 @@ pub struct ModelInfo {
     pub model_type: String,
 
     /// Model Path
-    pub path: String
+    pub path: String,
+
+    /// Token source
+    pub token_source: Option<String>,
 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
