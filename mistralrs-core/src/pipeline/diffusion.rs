@@ -85,7 +85,16 @@ impl Loader for DiffusionLoader {
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
         let paths: anyhow::Result<Box<dyn ModelPaths>> = {
-            let api = ApiBuilder::new()
+            // Tronai patch: activate cache & endpoint
+            use crate::GLOBAL_HF_CACHE;
+            use crate::GLOBAL_HF_ENDPOINT;
+            let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
+            let endpoint = GLOBAL_HF_ENDPOINT.get().cloned().unwrap_or_default();
+            //let api_builder = ApiBuilder::from_cache(cache).with_endpoint(endpoint);
+            // let api = api_builder.build()?;
+            //let api = Api::new()?;
+
+            let api = ApiBuilder::from_cache(cache).with_endpoint(endpoint)
                 .with_progress(!silent)
                 .with_token(get_token(&token_source)?)
                 .build()?;
