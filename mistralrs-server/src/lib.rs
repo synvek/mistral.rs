@@ -10,6 +10,7 @@ use hf_hub::Cache;
 use tokio::time::sleep;
 use mistralrs_core::{initialize_logging, ModelSelected, TokenSource, GLOBAL_HF_CACHE, GLOBAL_HF_ENDPOINT};
 use tracing::info;
+use std::future::Future;
 
 use mistralrs_server_core::{
     mistralrs_for_server_builder::{defaults, get_bert_model, MistralRsForServerBuilder},
@@ -179,6 +180,7 @@ fn parse_token_source(s: &str) -> Result<TokenSource, String> {
     s.parse()
 }
 
+type NotificationCallback = fn(String) -> ();
 
 static GLOBAL_LOCKS: OnceLock<Arc<Mutex<HashMap<String, ModelInfo>>>> = OnceLock::new();
 
@@ -235,88 +237,103 @@ pub fn get_server(task_id: String) -> Option<ModelInfo> {
 }
 
 //#[tokio::main]
-pub async fn start_server(task_id: String, run_args: Vec<OsString>, model_info: ModelInfo) -> Result<()> {
+pub async fn start_server<F, Fut>(task_id: String, run_args: Vec<OsString>, model_info: ModelInfo, callback: F) -> impl Future<Output = Result<()>>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<()>>, {
+    async move {
+        // let mut env_args: Vec<_> = env::args_os().collect();
+        // env_args.remove(1);
+        // env_args.remove(1);
+        // println!("{:?}", env_args);
+        // let args = Args::parse_from(env_args.drain(..));
+        // println!("{:?}", run_args);
+        let args = Args::try_parse_from(run_args)?;
+        // println!("{:?}", args);
+        //initialize_logging();
+        info!("Starting server with signal {}...", task_id);
+        insert_lock(task_id.clone(), model_info);
 
-    // let mut env_args: Vec<_> = env::args_os().collect();
-    // env_args.remove(1);
-    // env_args.remove(1);
-    // println!("{:?}", env_args);
-    // let args = Args::parse_from(env_args.drain(..));
-    // println!("{:?}", run_args);
-    let args = Args::try_parse_from(run_args)?;
-    // println!("{:?}", args);
-    //initialize_logging();
-    info!("Starting server with signal {}...", task_id);
-    insert_lock(task_id.clone(), model_info);
+        let mistralrs = MistralRsForServerBuilder::new()
+            .with_truncate_sequence(args.truncate_sequence)
+            .with_model(args.model)
+            .with_max_seqs(args.max_seqs)
+            .with_no_kv_cache(args.no_kv_cache)
+            .with_token_source(args.token_source)
+            .with_interactive_mode(args.interactive_mode)
+            .with_prefix_cache_n(args.prefix_cache_n)
+            .with_no_paged_attn(args.no_paged_attn)
+            .with_paged_attn(args.paged_attn)
+            .with_cpu(args.cpu)
+            .with_enable_search(args.enable_search)
+            .with_seed_optional(args.seed)
+            .with_log_optional(args.log)
+            .with_chat_template_optional(args.chat_template)
+            .with_jinja_explicit_optional(args.jinja_explicit)
+            .with_num_device_layers_optional(args.num_device_layers)
+            .with_in_situ_quant_optional(args.in_situ_quant)
+            .with_paged_attn_gpu_mem_optional(args.paged_attn_gpu_mem)
+            .with_paged_attn_gpu_mem_usage_optional(args.paged_attn_gpu_mem_usage)
+            .with_paged_ctxt_len_optional(args.paged_ctxt_len)
+            .with_paged_attn_block_size_optional(args.paged_attn_block_size)
+            .with_prompt_chunksize_optional(args.prompt_chunksize)
+            .build()
+            .await?;
 
-    let mistralrs = MistralRsForServerBuilder::new()
-        .with_truncate_sequence(args.truncate_sequence)
-        .with_model(args.model)
-        .with_max_seqs(args.max_seqs)
-        .with_no_kv_cache(args.no_kv_cache)
-        .with_token_source(args.token_source)
-        .with_interactive_mode(args.interactive_mode)
-        .with_prefix_cache_n(args.prefix_cache_n)
-        .with_no_paged_attn(args.no_paged_attn)
-        .with_paged_attn(args.paged_attn)
-        .with_cpu(args.cpu)
-        .with_enable_search(args.enable_search)
-        .with_seed_optional(args.seed)
-        .with_log_optional(args.log)
-        .with_chat_template_optional(args.chat_template)
-        .with_jinja_explicit_optional(args.jinja_explicit)
-        .with_num_device_layers_optional(args.num_device_layers)
-        .with_in_situ_quant_optional(args.in_situ_quant)
-        .with_paged_attn_gpu_mem_optional(args.paged_attn_gpu_mem)
-        .with_paged_attn_gpu_mem_usage_optional(args.paged_attn_gpu_mem_usage)
-        .with_paged_ctxt_len_optional(args.paged_ctxt_len)
-        .with_paged_attn_block_size_optional(args.paged_attn_block_size)
-        .with_prompt_chunksize_optional(args.prompt_chunksize)
-        .build()
-        .await?;
+        // TODO: refactor this
+        let bert_model = get_bert_model(args.enable_search, args.search_bert_model);
 
-    // TODO: refactor this
-    let bert_model = get_bert_model(args.enable_search, args.search_bert_model);
+        if args.interactive_mode {
+            interactive_mode(
+                mistralrs,
+                bert_model.is_some(),
+                args.enable_thinking.then_some(true),
+            )
+                .await;
+            return Ok(());
+        }
 
-    if args.interactive_mode {
-        interactive_mode(
-            mistralrs,
-            bert_model.is_some(),
-            args.enable_thinking.then_some(true),
-        )
-        .await;
-        return Ok(());
+        // Needs to be after the .build call as that is where the daemon waits.
+        let setting_server = if !args.interactive_mode {
+            let port = args.port.expect("Interactive mode was not specified, so expected port to be specified. Perhaps you forgot `-i` or `--port`?");
+            let ip = args.serve_ip.unwrap_or_else(|| "0.0.0.0".to_string());
+
+            // Create listener early to validate address before model loading
+            let listener = tokio::net::TcpListener::bind(format!("{ip}:{port}")).await?;
+            Some((listener, ip, port))
+        } else {
+            None
+        };
+
+        let app = MistralRsServerRouterBuilder::new()
+            .with_mistralrs(mistralrs)
+            .build()
+            .await?;
+
+        let model_info = get_server(task_id.clone());
+
+        if model_info.is_some() {
+            let mut new_model_info = model_info.unwrap();
+            new_model_info.started = true;
+            insert_lock(task_id.clone(), new_model_info);
+        }
+
+        tracing::info!("Model server is ready to serve {}...", task_id);
+
+        let notification = callback(task_id.clone()).await;
+        if notification.is_ok() {
+            tracing::info!("Model server is notified to serve {}...", task_id);
+        } else {
+            tracing::info!("Model server failed to notify to serve {}...", task_id);
+        }
+
+        tracing::info!("Model server is ready to bind port {}...", task_id);
+
+        if let Some((listener, ip, port)) = setting_server {
+            info!("Serving on http://{ip}:{}.", port);
+            axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(task_id)).await?;
+        };
+
+        Ok(())
     }
-
-    // Needs to be after the .build call as that is where the daemon waits.
-    let setting_server = if !args.interactive_mode {
-        let port = args.port.expect("Interactive mode was not specified, so expected port to be specified. Perhaps you forgot `-i` or `--port`?");
-        let ip = args.serve_ip.unwrap_or_else(|| "0.0.0.0".to_string());
-
-        // Create listener early to validate address before model loading
-        let listener = tokio::net::TcpListener::bind(format!("{ip}:{port}")).await?;
-        Some((listener, ip, port))
-    } else {
-        None
-    };
-
-    let app = MistralRsServerRouterBuilder::new()
-        .with_mistralrs(mistralrs)
-        .build()
-        .await?;
-
-    let model_info = get_server(task_id.clone());
-
-    if model_info.is_some() {
-        let mut new_model_info = model_info.unwrap();
-        new_model_info.started = true;
-        insert_lock(task_id.clone(), new_model_info);
-    }
-
-    if let Some((listener, ip, port)) = setting_server {
-        info!("Serving on http://{ip}:{}.", port);
-        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(task_id)).await?;
-    };
-
-    Ok(())
 }
