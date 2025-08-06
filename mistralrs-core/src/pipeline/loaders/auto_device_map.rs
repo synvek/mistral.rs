@@ -15,12 +15,14 @@ use super::DeviceMappedModelLoader;
 #[derive(Clone, Debug)]
 pub(crate) enum NonMappedSubModel {
     Vision,
+    Audio,
 }
 
 impl Display for NonMappedSubModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             NonMappedSubModel::Vision => write!(f, "vision"),
+            NonMappedSubModel::Audio => write!(f, "audio"),
         }
     }
 }
@@ -99,6 +101,7 @@ impl Display for AutoDeviceMapParams {
 }
 
 impl AutoDeviceMapParams {
+    // Default max sequence length for memory estimation when not specified
     pub const DEFAULT_MAX_SEQ_LEN: usize = 4 * 1024;
     pub const DEFAULT_MAX_BATCH_SIZE: usize = 1;
     pub const DEFAULT_MAX_NUM_IMAGES: usize = 1;
@@ -168,11 +171,9 @@ pub fn get_device_layers(
     devices: &[Device],
     dtype: DType,
     params: &AutoDeviceMapParams,
-    prompt_chunksize: usize,
     paged_attn_config: Option<&PagedAttentionConfig>,
 ) -> Result<DeviceMapMetadata> {
-    let mapped_max =
-        loader.mapped_max_act_size_elems(config, params, prompt_chunksize)? * dtype.size_in_bytes();
+    let mapped_max = loader.mapped_max_act_size_elems(config, params)? * dtype.size_in_bytes();
     let non_mapped_max =
         loader.non_mapped_max_act_size_elems(config, params)? * dtype.size_in_bytes();
 
@@ -194,6 +195,9 @@ pub fn get_device_layers(
                 cfg.mem_cpu,
                 Some(cfg.block_size.unwrap_or(DEFAULT_PAGED_ATTENTION_BLOCK_SIZE)),
                 dtype,
+                paged_attn_config
+                    .map(|cfg| cfg.cache_type)
+                    .unwrap_or_default(),
                 &*model_cfg,
                 &devices[0],
                 &devices.iter().map(|d| Some(d.clone())).collect::<Vec<_>>(),
@@ -335,7 +339,6 @@ pub fn get_device_layers(
             devices,
             dtype,
             params,
-            prompt_chunksize,
             None,
         );
     }

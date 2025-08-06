@@ -1,14 +1,13 @@
 use either::Either;
 use indexmap::IndexMap;
+use mistralrs_audio::AudioInput;
 use mistralrs_quant::IsqType;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    response::Response,
-    sampler::SamplingParams,
-    tools::{Tool, ToolChoice},
-    CustomLogitsProcessor, DiffusionGenerationParams,
+    response::Response, sampler::SamplingParams, tools::ToolChoice, CustomLogitsProcessor,
+    DiffusionGenerationParams, Tool,
 };
 use std::{fmt::Debug, sync::Arc};
 use tokio::sync::mpsc::Sender;
@@ -50,8 +49,10 @@ pub enum RequestMessage {
     },
     CompletionTokens(Vec<u32>),
     VisionChat {
-        #[serde(skip)] // TODO!!!!
+        #[serde(skip)] // TODO
         images: Vec<image::DynamicImage>,
+        #[serde(skip)] // TODO
+        audios: Vec<AudioInput>,
         messages: Vec<IndexMap<String, MessageContent>>,
         enable_thinking: Option<bool>,
     },
@@ -151,6 +152,7 @@ pub struct NormalRequest {
     pub logits_processors: Option<Vec<Arc<dyn CustomLogitsProcessor>>>,
     pub return_raw_logits: bool,
     pub web_search_options: Option<WebSearchOptions>,
+    pub model_id: Option<String>,
 }
 
 impl NormalRequest {
@@ -176,6 +178,7 @@ impl NormalRequest {
             logits_processors: None,
             return_raw_logits: false,
             web_search_options: None,
+            model_id: None,
         }
     }
 }

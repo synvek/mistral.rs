@@ -7,11 +7,22 @@ pub use request::*;
 pub use response::*;
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 use crate::Pipeline;
+use mistralrs_mcp::CalledFunction;
+
+// Re-export the types so they're accessible as tools::Type
+pub use mistralrs_mcp::{ToolCallback, ToolCallbackWithTool};
+
+/// Collection of callbacks keyed by tool name.
+pub type ToolCallbacks = HashMap<String, Arc<ToolCallback>>;
+
+/// Collection of callbacks with their tool definitions keyed by tool name.
+pub type ToolCallbacksWithTools = HashMap<String, ToolCallbackWithTool>;
 
 fn contains_tool_call_prefix(prefix: &str) -> bool {
     prefix.contains("<tool_call>")
@@ -192,6 +203,7 @@ impl ToolCallingMatcher {
         if let Ok(deser) = serde_json::from_str::<CalledFunctionParameters>(&message) {
             let id = format!("call-{}", Uuid::new_v4());
             Ok(vec![ToolCallResponse {
+                index: 0,
                 id,
                 tp: ToolCallType::Function,
                 function: CalledFunction {
@@ -202,9 +214,11 @@ impl ToolCallingMatcher {
         } else if let Ok(deser) = serde_json::from_str::<Vec<CalledFunctionParameters>>(&message) {
             Ok(deser
                 .into_iter()
-                .map(|deser| {
+                .enumerate()
+                .map(|(idx, deser)| {
                     let id = format!("call-{}", Uuid::new_v4());
                     Ok(ToolCallResponse {
+                        index: idx,
                         id,
                         tp: ToolCallType::Function,
                         function: CalledFunction {
@@ -230,7 +244,7 @@ fn could_be_json<T>(text_prefix: &str) -> (bool, bool)
 where
     T: serde::de::DeserializeOwned,
 {
-    if text_prefix.is_empty() {
+    if text_prefix.trim().is_empty() {
         return (false, false);
     }
     match serde_json::from_str::<T>(text_prefix) {

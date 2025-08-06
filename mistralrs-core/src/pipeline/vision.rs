@@ -4,13 +4,14 @@ use super::{
     get_model_paths, get_xlora_paths, AdapterKind, AnyMoePipelineMixin, AutoVisionLoader,
     CacheManager, CacheManagerMixin, EitherCache, ForwardInputsResult, Gemma3Loader,
     GeneralMetadata, IsqPipelineMixin, Loader, MetadataMixin, MiniCpmOLoader, ModelCategory,
-    ModelKind, ModelPaths, Phi4MMLoader, PreProcessingMixin, Processor, Qwen2VLLoader, TokenSource,
-    VLlama4Loader, VLlamaLoader, VisionModel, VisionModelLoader, VisionPromptPrefixer,
+    ModelKind, ModelPaths, MultimodalPromptPrefixer, Phi4MMLoader, PreProcessingMixin, Processor,
+    Qwen2VLLoader, TokenSource, VLlama4Loader, VLlamaLoader, VisionModel, VisionModelLoader,
 };
 use super::{
-    Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader, Mistral3Loader, Phi3VLoader,
-    Qwen2_5VLLoader, VisionLoaderType,
+    Gemma3nLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader, Mistral3Loader,
+    Phi3VLoader, Qwen2_5VLLoader, VisionLoaderType,
 };
+use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
 use crate::distributed::{self, WorkerTransferData};
 use crate::kv_cache::{FullCacheManager, NormalCacheManager};
@@ -46,7 +47,6 @@ use rand_isaac::Isaac64Rng;
 use regex_automata::meta::Regex;
 use std::any::Any;
 use std::borrow::Cow;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -66,7 +66,7 @@ pub struct VisionPipeline {
     preprocessor_config: Arc<PreProcessorConfig>,
     topology: Option<Topology>,
     silent: bool,
-    prefixer: Arc<dyn VisionPromptPrefixer>,
+    prefixer: Arc<dyn MultimodalPromptPrefixer>,
     mapper: Box<dyn DeviceMapper + Send + Sync>,
 
     // For full UQFF serialization
@@ -112,7 +112,6 @@ pub struct VisionLoaderBuilder {
 #[derive(Clone, Default)]
 /// Config specific to loading a vision model.
 pub struct VisionSpecificConfig {
-    pub prompt_chunksize: Option<NonZeroUsize>,
     pub topology: Option<Topology>,
     pub write_uqff: Option<PathBuf>,
     pub from_uqff: Option<Vec<PathBuf>>,
@@ -120,6 +119,8 @@ pub struct VisionSpecificConfig {
     pub imatrix: Option<PathBuf>,
     pub calibration_file: Option<PathBuf>,
     pub hf_cache_path: Option<PathBuf>,
+    pub matformer_config_path: Option<PathBuf>,
+    pub matformer_slice_name: Option<String>,
 }
 
 impl VisionLoaderBuilder {
@@ -170,6 +171,7 @@ impl VisionLoaderBuilder {
             Some(VisionLoaderType::Gemma3) => Box::new(Gemma3Loader),
             Some(VisionLoaderType::Mistral3) => Box::new(Mistral3Loader),
             Some(VisionLoaderType::Llama4) => Box::new(VLlama4Loader),
+            Some(VisionLoaderType::Gemma3n) => Box::new(Gemma3nLoader),
             None => Box::new(AutoVisionLoader),
         };
         Box::new(VisionLoader {
@@ -257,6 +259,8 @@ impl Loader for VisionLoader {
             paged_attn_config = None;
         }
 
+        info!("Prompt chunk size is {ATTENTION_CHUNK_SIZE}.");
+
         let use_nccl = mistralrs_quant::distributed::use_nccl();
 
         let available_devices = if let Ok(payload) = env::var(distributed::IS_DAEMON_FLAG) {
@@ -272,6 +276,27 @@ impl Loader for VisionLoader {
             available_devices[0].clone()
         } else {
             device.clone()
+        };
+
+        // Load matformer slicing config if provided
+        let matformer_slicing_config = if let Some(matformer_path) =
+            &self.config.matformer_config_path
+        {
+            use crate::matformer::{MatformerConfig, MatformerSliceConfig};
+            info!("Loading Matformer config from {:?}", matformer_path);
+            let config = Arc::new(MatformerConfig::from_file(matformer_path)?);
+
+            if let Some(slice_name) = &self.config.matformer_slice_name {
+                info!("Using Matformer slice: {}", slice_name);
+                Some(MatformerSliceConfig::new(slice_name.clone(), config))
+            } else {
+                // If no slice name is provided but config exists, we'll need to handle this
+                // For now, return None and let the model handle the default slice selection
+                warn!("Matformer config loaded but no slice name specified. Models will use their default slice.");
+                None
+            }
+        } else {
+            None
         };
 
         // If auto, convert to Map if not using nccl
@@ -328,12 +353,18 @@ impl Loader for VisionLoader {
                         total_pack_factors / total_tensors
                     };
 
-                    let layer_sizes_in_bytes =
-                        self.inner
-                            .layer_sizes_in_bytes(&config, dtype, weight_pack_factor)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner
-                            .non_mapped_size_in_bytes(&config, dtype, weight_pack_factor)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -342,12 +373,18 @@ impl Loader for VisionLoader {
                     )
                 } else if let Some(isq) = in_situ_quant {
                     let weight_pack_factor = isq.pack_factor(dtype);
-                    let layer_sizes_in_bytes =
-                        self.inner
-                            .layer_sizes_in_bytes(&config, dtype, weight_pack_factor)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner
-                            .non_mapped_size_in_bytes(&config, dtype, weight_pack_factor)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -358,12 +395,18 @@ impl Loader for VisionLoader {
                     // Be sure to get the weight pack factor here; we might be loading a prequantized model.
                     let weight_pack_factor =
                         QuantizationConfigShim::get_quant_config_pack_factor(&config, dtype)?;
-                    let layer_sizes_in_bytes =
-                        self.inner
-                            .layer_sizes_in_bytes(&config, dtype, weight_pack_factor)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner
-                            .non_mapped_size_in_bytes(&config, dtype, weight_pack_factor)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        matformer_slicing_config.as_ref(),
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -382,7 +425,6 @@ impl Loader for VisionLoader {
                 &available_devices,
                 dtype,
                 &params,
-                params.max_seq_len(),
                 paged_attn_config.as_ref(),
             )?;
             mapper = DeviceMapSetting::Map(new);
@@ -408,7 +450,7 @@ impl Loader for VisionLoader {
         // TODO: PagedAttention is not supported with CPU for now.
         // This check is not really necessary because `get_device_layers` should prevent it.
         let mapping_uses_cpu = mapper.get_unique_devices().iter().any(Device::is_cpu);
-        if mapping_uses_cpu {
+        if mapping_uses_cpu && paged_attn_config.is_some() {
             warn!("Device mapping contains a mix of GPU and CPU. There is no CPU support for PagedAttention, disabling PagedAttention.");
             paged_attn_config = None;
         }
@@ -490,6 +532,7 @@ impl Loader for VisionLoader {
                     device.clone(),
                     attention_mechanism,
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 _ => unreachable!(),
             }
@@ -509,6 +552,7 @@ impl Loader for VisionLoader {
                     device.clone(),
                     attention_mechanism,
                     multi_progress,
+                    matformer_slicing_config.clone(),
                 ),
                 _ => unreachable!(),
             }
@@ -539,10 +583,9 @@ impl Loader for VisionLoader {
             Some(processor.get_special_tokens()),
         )?;
 
-        let gen_conf: Option<GenerationConfig> = paths.get_gen_conf_filename().map(|f| {
-            serde_json::from_str(&fs::read_to_string(f).unwrap())
-                .expect("bos_token_id/eos_token_id missing in generation_config.json")
-        });
+        let gen_conf: Option<GenerationConfig> = paths
+            .get_gen_conf_filename()
+            .map(|f| serde_json::from_str(&fs::read_to_string(f).unwrap()).unwrap());
         let chat_template_explicit = paths
             .get_chat_template_explicit()
             .as_ref()
@@ -680,6 +723,7 @@ impl Loader for VisionLoader {
                 paged_attn_config.mem_cpu,
                 paged_attn_config.block_size,
                 dtype,
+                paged_attn_config.cache_type,
                 model.config(),
                 &device,
                 &layer_devices,
@@ -719,8 +763,8 @@ impl Loader for VisionLoader {
                 sliding_window,
                 cache_config,
                 cache_engine,
-                prompt_chunksize: self.config.prompt_chunksize,
                 model_metadata: Some(model_metadata),
+                modalities: self.inner.modalities(&config)?,
             }),
             processor,
             prefixer: self.inner.prefixer(&config),
@@ -961,7 +1005,9 @@ impl AnyMoePipelineMixin for VisionPipeline {
             ));
 
             let mut filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
+            for rfilename in
+                api_dir_list!(api, model_id, true).filter(|x| x.ends_with(".safetensors"))
+            {
                 filenames.push(api_get_file!(api, &rfilename, model_id));
             }
 
@@ -1017,7 +1063,9 @@ impl AnyMoePipelineMixin for VisionPipeline {
             ));
 
             let mut gate_filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
+            for rfilename in
+                api_dir_list!(api, model_id, true).filter(|x| x.ends_with(".safetensors"))
+            {
                 gate_filenames.push(api_get_file!(api, &rfilename, model_id));
             }
             assert_eq!(

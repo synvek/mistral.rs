@@ -330,6 +330,71 @@ async fn do_extraction(
     second_request
 }
 
+async fn do_custom_tool(
+    this: Arc<Engine>,
+    mut second_request: NormalRequest,
+    tool_calls: &ToolCallResponse,
+) -> NormalRequest {
+    let messages = match &mut second_request.messages {
+        RequestMessage::Chat { messages, .. } | RequestMessage::VisionChat { messages, .. } => {
+            messages
+        }
+        _ => unreachable!(),
+    };
+
+    {
+        let mut message: IndexMap<String, MessageContent> = IndexMap::new();
+        message.insert("role".to_string(), Either::Left("assistant".to_string()));
+        message.insert(
+            "content".to_string(),
+            Either::Left(format!(
+                "{{\"name\":\"{}\",\"arguments\":\"{}\"}}",
+                tool_calls.function.name, tool_calls.function.arguments
+            )),
+        );
+        messages.push(message);
+    }
+
+    let result = if let Some(cb) = this.tool_callbacks.get(&tool_calls.function.name) {
+        tracing::info!("Called tool `{}`.", tool_calls.function.name);
+        cb(&tool_calls.function).unwrap_or_else(|e| {
+            tracing::error!(
+                "Error when calling tool `{}`: {e}",
+                tool_calls.function.name
+            );
+            format!("ERROR: {e}")
+        })
+    } else if let Some(callback_with_tool) = this
+        .tool_callbacks_with_tools
+        .get(&tool_calls.function.name)
+    {
+        tracing::info!("Called tool `{}`.", tool_calls.function.name);
+        (callback_with_tool.callback)(&tool_calls.function).unwrap_or_else(|e| {
+            tracing::error!(
+                "Error when calling tool `{}`: {e}",
+                tool_calls.function.name
+            );
+            format!("ERROR: {e}")
+        })
+    } else {
+        tracing::error!(
+            "Attempted to call tool `{}`, but it doesn't exist.",
+            tool_calls.function.name
+        );
+        format!("ERROR: no tool callback for {}", tool_calls.function.name)
+    };
+
+    {
+        let mut message: IndexMap<String, MessageContent> = IndexMap::new();
+        message.insert("role".to_string(), Either::Left("tool".to_string()));
+        message.insert("content".to_string(), Either::Left(result));
+        messages.push(message);
+    }
+
+    second_request.tool_choice = Some(ToolChoice::Auto);
+    second_request
+}
+
 /// Drive one or more web-search / extraction rounds without recursion.
 ///
 /// Strategy:
@@ -340,10 +405,7 @@ async fn do_extraction(
 /// 4. Forward every user-visible reply **except** the first, which is just the
 ///    probe that discovers whether a tool call is needed.
 pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
-    // We entered this function only when web_search_options is Some(_)
-    let Some(web_search_options) = request.web_search_options.clone() else {
-        unreachable!()
-    };
+    let web_search_options = request.web_search_options.clone();
 
     // The sender that ultimately delivers data back to the caller.
     let user_sender = request.response.clone();
@@ -353,10 +415,26 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
     // Build the *first* request (the “probe”).
     // ---------------------------------------------------------------------
     let mut probe = request.clone();
-    probe
-        .tools
-        .get_or_insert_with(Vec::new)
-        .extend(search::get_search_tools(&web_search_options).unwrap());
+    if let Some(ref opts) = web_search_options {
+        probe
+            .tools
+            .get_or_insert_with(Vec::new)
+            .extend(search::get_search_tools(opts).unwrap());
+    }
+
+    // Add Tool definitions from tool callbacks with tools if they're not already present
+    if !this.tool_callbacks_with_tools.is_empty() {
+        let tools = probe.tools.get_or_insert_with(Vec::new);
+        let existing_tool_names: Vec<String> =
+            tools.iter().map(|t| t.function.name.clone()).collect();
+
+        for (name, callback_with_tool) in &this.tool_callbacks_with_tools {
+            if !existing_tool_names.contains(name) {
+                tools.push(callback_with_tool.tool.clone());
+            }
+        }
+    }
+
     probe.tool_choice = Some(ToolChoice::Auto);
     // Prevent accidental infinite recursion on the probe itself.
     probe.web_search_options = None;
@@ -371,8 +449,6 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
         // `current` is what we actually dispatch each loop.
         // The very first time that is the hidden probe.
         let mut current = probe;
-        // Forward results to the user after the first loop.
-        let mut forward_to_user = false;
 
         loop {
             // Each dispatch gets its own one-shot channel so we can peek at
@@ -385,41 +461,79 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
 
             // ----------------------- NON-STREAMING ------------------------
             if !is_streaming {
-                let ResponseOk::Done(done) = receiver.recv().await.unwrap().as_result().unwrap()
-                else {
-                    unreachable!();
+                let done = match receiver.recv().await.unwrap().as_result().unwrap() {
+                    ResponseOk::Done(done) => done,
+                    other => {
+                        match other {
+                            ResponseOk::Chunk(res) => {
+                                user_sender.send(Response::Chunk(res)).await.unwrap()
+                            }
+                            ResponseOk::CompletionChunk(res) => user_sender
+                                .send(Response::CompletionChunk(res))
+                                .await
+                                .unwrap(),
+                            ResponseOk::Done(_) => unreachable!(),
+                            ResponseOk::CompletionDone(res) => user_sender
+                                .send(Response::CompletionDone(res))
+                                .await
+                                .unwrap(),
+                            ResponseOk::ImageGeneration(res) => user_sender
+                                .send(Response::ImageGeneration(res))
+                                .await
+                                .unwrap(),
+                            ResponseOk::Raw {
+                                logits_chunks,
+                                tokens,
+                            } => user_sender
+                                .send(Response::Raw {
+                                    logits_chunks,
+                                    tokens,
+                                })
+                                .await
+                                .unwrap(),
+                            ResponseOk::Speech {
+                                pcm,
+                                rate,
+                                channels,
+                            } => user_sender
+                                .send(Response::Speech {
+                                    pcm,
+                                    rate,
+                                    channels,
+                                })
+                                .await
+                                .unwrap(),
+                        };
+                        return;
+                    }
                 };
-
-                // Forward to the caller once the probe is out of the way.
-                if forward_to_user {
-                    user_sender
-                        .send(Response::Done(done.clone()))
-                        .await
-                        .unwrap();
-                }
 
                 // Did the assistant ask to run a tool?
                 let tc_opt = match &done.choices[0].message.tool_calls {
-                    Some(calls)
-                        if calls.len() == 1
-                            && search::search_tool_called(&calls[0].function.name) =>
-                    {
-                        Some(&calls[0])
-                    }
+                    Some(calls) if calls.len() == 1 => Some(&calls[0]),
                     _ => None,
                 };
 
                 // No tool call? We are finished.
                 if tc_opt.is_none() {
-                    break;
+                    user_sender
+                        .send(Response::Done(done.clone()))
+                        .await
+                        .unwrap();
+                    return;
                 }
 
                 // Tool requested → build the next turn.
                 let tc = tc_opt.unwrap();
-                let next_visible = if tc.function.name == search::SEARCH_TOOL_NAME {
-                    do_search(this_clone.clone(), visible_req, tc, &web_search_options).await
+                let next_visible = if search::search_tool_called(&tc.function.name) {
+                    let web_search_options = web_search_options.as_ref().unwrap();
+                    if tc.function.name == search::SEARCH_TOOL_NAME {
+                        do_search(this_clone.clone(), visible_req, tc, web_search_options).await
+                    } else {
+                        do_extraction(this_clone.clone(), visible_req, tc, web_search_options).await
+                    }
                 } else {
-                    do_extraction(this_clone.clone(), visible_req, tc, &web_search_options).await
+                    do_custom_tool(this_clone.clone(), visible_req, tc).await
                 };
 
                 // The fresh request becomes both the user-visible context and
@@ -427,7 +541,6 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                 visible_req = next_visible.clone();
                 visible_req.response = user_sender.clone();
                 current = visible_req.clone();
-                forward_to_user = true;
             }
             // ------------------------- STREAMING -------------------------
             else {
@@ -461,19 +574,56 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                                 break;
                             }
                         }
-                        _ => unreachable!(),
+                        other => {
+                            match other {
+                                ResponseOk::Chunk(_) => unreachable!(),
+                                ResponseOk::CompletionChunk(res) => user_sender
+                                    .send(Response::CompletionChunk(res))
+                                    .await
+                                    .unwrap(),
+                                ResponseOk::Done(res) => {
+                                    user_sender.send(Response::Done(res)).await.unwrap()
+                                }
+                                ResponseOk::CompletionDone(res) => user_sender
+                                    .send(Response::CompletionDone(res))
+                                    .await
+                                    .unwrap(),
+                                ResponseOk::ImageGeneration(res) => user_sender
+                                    .send(Response::ImageGeneration(res))
+                                    .await
+                                    .unwrap(),
+                                ResponseOk::Raw {
+                                    logits_chunks,
+                                    tokens,
+                                } => user_sender
+                                    .send(Response::Raw {
+                                        logits_chunks,
+                                        tokens,
+                                    })
+                                    .await
+                                    .unwrap(),
+                                ResponseOk::Speech {
+                                    pcm,
+                                    rate,
+                                    channels,
+                                } => user_sender
+                                    .send(Response::Speech {
+                                        pcm,
+                                        rate,
+                                        channels,
+                                    })
+                                    .await
+                                    .unwrap(),
+                            };
+                            return;
+                        }
                     }
                 }
 
                 let Some(choice) = last_choice else { break };
 
                 let tc_opt = match &choice.delta.tool_calls {
-                    Some(calls)
-                        if calls.len() == 1
-                            && search::search_tool_called(&calls[0].function.name) =>
-                    {
-                        Some(&calls[0])
-                    }
+                    Some(calls) if calls.len() == 1 => Some(&calls[0]),
                     _ => None,
                 };
 
@@ -482,16 +632,20 @@ pub(super) async fn search_request(this: Arc<Engine>, request: NormalRequest) {
                 }
 
                 let tc = tc_opt.unwrap();
-                let next_visible = if tc.function.name == search::SEARCH_TOOL_NAME {
-                    do_search(this_clone.clone(), visible_req, tc, &web_search_options).await
+                let next_visible = if search::search_tool_called(&tc.function.name) {
+                    let web_search_options = web_search_options.as_ref().unwrap();
+                    if tc.function.name == search::SEARCH_TOOL_NAME {
+                        do_search(this_clone.clone(), visible_req, tc, web_search_options).await
+                    } else {
+                        do_extraction(this_clone.clone(), visible_req, tc, web_search_options).await
+                    }
                 } else {
-                    do_extraction(this_clone.clone(), visible_req, tc, &web_search_options).await
+                    do_custom_tool(this_clone.clone(), visible_req, tc).await
                 };
 
                 visible_req = next_visible.clone();
                 visible_req.response = user_sender.clone();
                 current = visible_req.clone();
-                forward_to_user = true;
             }
         }
     });

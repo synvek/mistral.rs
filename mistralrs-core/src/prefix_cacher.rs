@@ -10,7 +10,7 @@ use tracing::info;
 
 use crate::{
     get_mut_arcmutex,
-    paged_attention::{BlockEngine, BlockEngineSequence, LogicalTokenBlock, PhysicalTokenBlock},
+    paged_attention::{BlockEngine, LogicalTokenBlock, PhysicalTokenBlock},
     pipeline::KvCache,
     sequence::{self, Sequence},
 };
@@ -19,6 +19,7 @@ type BlockBestMatch<'a> = (
     usize,                         // matched_len
     &'a [LogicalTokenBlock],       // logical blocks
     &'a [Arc<PhysicalTokenBlock>], // physical blocks
+    usize,                         // audios_match_until
     usize,                         // images_match_until
 );
 
@@ -56,6 +57,7 @@ impl From<Vec<u32>> for Tokens {
 #[derive(Clone)]
 struct CacheElement {
     cache: Vec<Option<KvCache>>,
+    audio_hashes: Option<Vec<u64>>,
     image_hashes: Option<Vec<u64>>,
 }
 
@@ -64,6 +66,7 @@ struct BlockCacheElement {
     logical_blocks: Vec<LogicalTokenBlock>,
     physical_blocks: Vec<Arc<PhysicalTokenBlock>>,
     image_hashes: Option<Vec<u64>>,
+    audio_hashes: Option<Vec<u64>>,
 }
 
 pub struct PrefixCacheManagerV2 {
@@ -79,6 +82,7 @@ pub enum MatchingCache {
     Normal {
         normal: Vec<Option<KvCache>>,
         images_to_keep: usize,
+        audios_to_keep: usize,
         toks: Vec<u32>,
         offset: usize,
     },
@@ -88,6 +92,7 @@ pub enum MatchingCache {
         toks: Vec<u32>,
         offset: usize,
         images_to_keep: usize,
+        audios_to_keep: usize,
     },
 }
 
@@ -116,36 +121,27 @@ impl PrefixCacheManagerV2 {
             return;
         }
 
-        if let Some(block_engine) = &self.block_engine {
-            let logical_token_blocks = seq.logical_token_blocks();
-            let block_engine = get_mut_arcmutex!(block_engine);
-            let block_table = &block_engine.block_tables[seq.id()];
-            let hashed_logical_blocks = hash_logical_blocks(logical_token_blocks);
+        if let Some(_block_engine) = &self.block_engine {
+            // let logical_token_blocks = seq.logical_token_blocks();
+            // let block_engine = get_mut_arcmutex!(block_engine);
+            // let block_table = &block_engine.block_tables[seq.id()];
+            // let hashed_logical_blocks = hash_logical_blocks(logical_token_blocks);
 
-            if !self.block_caches.contains_key(&hashed_logical_blocks) {
-                for block in block_table {
-                    let id = block.deref_mut().block_id;
-                    for BlockCacheElement {
-                        physical_blocks, ..
-                    } in self.block_caches.values()
-                    {
-                        if physical_blocks.iter().any(|x| x.deref_mut().block_id == id) {
-                            return;
-                        }
-                    }
+            // if !self.block_caches.contains_key(&hashed_logical_blocks) {
+            //     for block in block_table {
+            //         block.deref_mut().increment_refcount();
+            //     }
 
-                    block.deref_mut().increment_refcount();
-                }
-
-                self.block_caches.insert(
-                    hashed_logical_blocks,
-                    BlockCacheElement {
-                        logical_blocks: logical_token_blocks.to_vec(),
-                        physical_blocks: block_table.clone(),
-                        image_hashes: seq.image_hashes().map(|x| x.to_vec()),
-                    },
-                );
-            }
+            //     self.block_caches.insert(
+            //         hashed_logical_blocks,
+            //         BlockCacheElement {
+            //             logical_blocks: logical_token_blocks.to_vec(),
+            //             physical_blocks: block_table.clone(),
+            //             image_hashes: seq.image_hashes().map(|x| x.to_vec()),
+            //             audio_hashes: seq.audio_hashes().map(|x| x.to_vec()),
+            //         },
+            //     );
+            // }
         } else {
             let cache = seq.normal_cache().to_vec();
 
@@ -154,6 +150,7 @@ impl PrefixCacheManagerV2 {
                 CacheElement {
                     cache,
                     image_hashes: seq.image_hashes().map(|x| x.to_vec()),
+                    audio_hashes: seq.audio_hashes().map(|x| x.to_vec()),
                 },
             );
         }
@@ -260,7 +257,7 @@ impl PrefixCacheManagerV2 {
         &mut self,
         toks: &[u32],
         image_hashes: Option<&[u64]>,
-        _contains_images: bool,
+        audio_hashes: Option<&[u64]>,
     ) -> Result<Option<MatchingCache>> {
         // Do not search if prefix caching disabled or no tokens
         if self.no_prefix_cache || toks.is_empty() {
@@ -304,7 +301,20 @@ impl PrefixCacheManagerV2 {
                     0
                 };
 
-                if best_match.is_some_and(|(best_match_len, _, _, _)| best_match_len < matched_len)
+                let audios_match_until = if let (Some(input_hashes), Some(cached_hashes)) =
+                    (audio_hashes, cache_elem.audio_hashes.as_ref())
+                {
+                    input_hashes
+                        .iter()
+                        .zip(cached_hashes)
+                        .take_while(|(a, b)| a == b)
+                        .count()
+                } else {
+                    0
+                };
+
+                if best_match
+                    .is_some_and(|(best_match_len, _, _, _, _)| best_match_len < matched_len)
                     || best_match.is_none()
                 {
                     best_match = Some((
@@ -312,11 +322,18 @@ impl PrefixCacheManagerV2 {
                         &cache_elem.logical_blocks,
                         &cache_elem.physical_blocks,
                         images_match_until,
+                        audios_match_until,
                     ))
                 }
             }
 
-            let Some((match_len, logical_blocks, physical_blocks, images_match_until)) = best_match
+            let Some((
+                match_len,
+                logical_blocks,
+                physical_blocks,
+                images_match_until,
+                audios_match_until,
+            )) = best_match
             else {
                 return Ok(None);
             };
@@ -338,8 +355,13 @@ impl PrefixCacheManagerV2 {
 
             // If the last reused block is full, reserve an extra empty block for new tokens
             let new_toks = toks[match_len..].to_vec();
-            for _ in 0..new_toks.len().div_ceil(block_size) {
-                logical_prefix.push(LogicalTokenBlock::new(block_size));
+            logical_prefix.push(LogicalTokenBlock::new(block_size));
+            for tok in &new_toks {
+                sequence::util_append_token_to_blocks(
+                    *tok as usize,
+                    &mut logical_prefix,
+                    block_size,
+                );
             }
             if logical_prefix.last().is_some_and(|last| last.is_full()) {
                 logical_prefix.push(LogicalTokenBlock::new(block_size));
@@ -349,18 +371,24 @@ impl PrefixCacheManagerV2 {
             } else {
                 0
             };
+            let audios_to_keep = if let Some(input_hashes) = audio_hashes {
+                input_hashes.len().saturating_sub(audios_match_until)
+            } else {
+                0
+            };
             return Ok(Some(MatchingCache::Paged {
                 logical_blocks: logical_prefix,
                 physical_blocks: physical_prefix,
                 toks: new_toks,
                 offset: match_len,
                 images_to_keep,
+                audios_to_keep,
             }));
         }
 
         let toks = Tokens(toks.to_vec());
 
-        let mut best_match: Option<(usize, &CacheElement, usize)> = None;
+        let mut best_match: Option<(usize, &CacheElement, usize, usize)> = None;
         for (k, v) in &self.caches {
             let match_len = toks.shared_prefix_len(k);
             if match_len == 0 {
@@ -379,15 +407,28 @@ impl PrefixCacheManagerV2 {
                 None => 0,
             };
 
+            let audios_match_until = match audio_hashes {
+                Some(input_hashes) => match &v.audio_hashes {
+                    Some(cached_hashes) => input_hashes
+                        .iter()
+                        .zip(cached_hashes)
+                        .take_while(|(a, b)| a == b)
+                        .count(),
+                    None => 0,
+                },
+                None => 0,
+            };
+
             if best_match
                 .as_ref()
-                .is_none_or(|(len, _, _)| match_len > *len)
+                .is_none_or(|(len, _, _, _)| match_len > *len)
             {
-                best_match = Some((match_len, v, images_match_until));
+                best_match = Some((match_len, v, images_match_until, audios_match_until));
             }
         }
 
-        if let Some((match_len, cache_element, images_match_until)) = best_match {
+        if let Some((match_len, cache_element, images_match_until, audios_match_until)) = best_match
+        {
             let new_toks = toks.0[match_len..].to_vec();
             if new_toks.is_empty() {
                 return Ok(None);
@@ -400,15 +441,23 @@ impl PrefixCacheManagerV2 {
             } else {
                 0
             };
+            let audios_to_keep = if let Some(input_hashes) = audio_hashes {
+                input_hashes.len().saturating_sub(audios_match_until)
+            } else {
+                0
+            };
             for layer in cache.cache.iter_mut().flatten() {
-                if let Err(e) = layer.set_len(match_len) {
-                    tracing::warn!("Failed to set cache length to {}: {:?}", match_len, e);
+                if layer.try_set_len(match_len).is_err() {
                     return Ok(None);
                 }
+            }
+            for layer in cache.cache.iter_mut().flatten() {
+                layer.set_len(match_len)?;
             }
             return Ok(Some(MatchingCache::Normal {
                 normal: cache.cache,
                 images_to_keep,
+                audios_to_keep,
                 toks: new_toks,
                 offset: match_len,
             }));

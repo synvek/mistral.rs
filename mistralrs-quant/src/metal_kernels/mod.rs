@@ -32,6 +32,8 @@ pub enum MetalKernelError {
     FailedToCreatePipeline(String),
     #[error("dtype mismatch, got {got:?}, expected {expected:?}")]
     DTypeMismatch { expected: Vec<DType>, got: DType },
+    #[error("Failed to compile Metal shader: {0}")]
+    CompilationError(String),
 }
 
 impl<T> From<std::sync::PoisonError<T>> for MetalKernelError {
@@ -68,13 +70,198 @@ impl Kernels {
             Ok(lib.clone())
         } else {
             let source_data = KERNELS;
-            let lib = device.new_library_with_data(source_data).map_err(|e| {
-                MetalKernelError::LoadLibraryError(format!(
-                    "Metal requires macosx > 13.0 or higher, cannot load candle metal library: {e}"
-                ))
-            })?;
+            // Check if the precompiled library is empty (which indicates runtime compilation is needed)
+            let lib = if source_data.is_empty() {
+                // Runtime compilation path
+                self.compile_kernels_at_runtime(device)?
+            } else {
+                // Precompiled path
+                device.new_library_with_data(source_data).map_err(|e| {
+                    MetalKernelError::LoadLibraryError(format!(
+                        "Metal requires macosx > 13.0 or higher, cannot load candle metal library: {e}"
+                    ))
+                })?
+            };
             Ok(LIBRARY.get_or_init(|| lib).clone())
         }
+    }
+
+    fn compile_kernels_at_runtime(&self, device: &Device) -> Result<Library, MetalKernelError> {
+        use std::collections::{HashMap, HashSet};
+
+        // Create a virtual filesystem with all our Metal sources
+        let mut file_system = HashMap::new();
+        file_system.insert("bitwise.metal", include_str!("bitwise.metal"));
+        file_system.insert("blockwise_fp8.metal", include_str!("blockwise_fp8.metal"));
+        file_system.insert("bnb_dequantize.metal", include_str!("bnb_dequantize.metal"));
+        file_system.insert("hqq_dequantize.metal", include_str!("hqq_dequantize.metal"));
+        file_system.insert("quantized.metal", include_str!("quantized.metal"));
+        file_system.insert("scan.metal", include_str!("scan.metal"));
+        file_system.insert("sort.metal", include_str!("sort.metal"));
+        file_system.insert("copy.metal", include_str!("copy.metal"));
+        file_system.insert("utils.metal", include_str!("utils.metal"));
+        file_system.insert("bf16.metal", include_str!("bf16.metal"));
+        file_system.insert("scan_impl.metal", include_str!("scan_impl.metal"));
+        file_system.insert("sort_impl.metal", include_str!("sort_impl.metal"));
+        file_system.insert("copy_impl.metal", include_str!("copy_impl.metal"));
+        file_system.insert("float8.metal", include_str!("float8.metal"));
+        file_system.insert("float4.metal", include_str!("float4.metal"));
+
+        // Recursive include preprocessor
+        fn preprocess_includes(
+            content: &str,
+            current_file: &str,
+            file_system: &HashMap<&str, &str>,
+            included_files: &mut HashSet<String>,
+            include_stack: &mut Vec<String>,
+        ) -> Result<String, String> {
+            // Check for circular includes
+            if include_stack.contains(&current_file.to_string()) {
+                return Err(format!(
+                    "Circular include detected: {} -> {}",
+                    include_stack.join(" -> "),
+                    current_file
+                ));
+            }
+
+            include_stack.push(current_file.to_string());
+
+            let mut result = String::new();
+            let lines = content.lines();
+
+            for line in lines {
+                let trimmed = line.trim();
+
+                // Check for #include directive
+                if trimmed.starts_with("#include") {
+                    // Extract the included filename
+                    if let Some(start) = trimmed.find('"') {
+                        if let Some(end) = trimmed[start + 1..].find('"') {
+                            let include_file = &trimmed[start + 1..start + 1 + end];
+
+                            // Check if this is one of our local files
+                            if let Some(included_content) = file_system.get(include_file) {
+                                // Only include each file once (like #pragma once)
+                                if !included_files.contains(include_file) {
+                                    included_files.insert(include_file.to_string());
+
+                                    // Recursively process the included file
+                                    let processed = preprocess_includes(
+                                        included_content,
+                                        include_file,
+                                        file_system,
+                                        included_files,
+                                        include_stack,
+                                    )?;
+
+                                    result.push_str(&format!(
+                                        "\n// ===== Start of {include_file} =====\n"
+                                    ));
+                                    result.push_str(&processed);
+                                    result.push_str(&format!(
+                                        "\n// ===== End of {include_file} =====\n"
+                                    ));
+                                }
+                                // Skip the original #include line
+                                continue;
+                            } else if !trimmed.contains('<') {
+                                // This is a quoted include but not one of our files
+                                // Skip it to avoid "file not found" errors
+                                continue;
+                            }
+                        }
+                    }
+                    // For system includes (with < >), keep them
+                    if trimmed.contains('<') {
+                        result.push_str(line);
+                        result.push('\n');
+                    }
+                } else if trimmed == "#pragma once" {
+                    // Skip #pragma once as we handle it differently
+                    continue;
+                } else {
+                    // Fix backslash-newline warnings by removing trailing spaces
+                    if line.ends_with("\\ ") || line.ends_with("\\\t") {
+                        let cleaned = line.trim_end();
+                        let without_backslash = cleaned.trim_end_matches('\\');
+                        result.push_str(without_backslash);
+                        result.push_str(" \\");
+                    } else {
+                        result.push_str(line);
+                    }
+                    result.push('\n');
+                }
+            }
+
+            include_stack.pop();
+            Ok(result)
+        }
+
+        // Start with a clean slate
+        let mut included_files = HashSet::new();
+        let mut include_stack = Vec::new();
+
+        // Build the main source file
+        let mut main_source = String::new();
+
+        // Add standard Metal includes first
+        main_source.push_str("#include <metal_stdlib>\n");
+        main_source.push_str("#include <metal_common>\n");
+        main_source.push_str("#include <metal_math>\n");
+        main_source.push_str("#include <metal_integer>\n");
+        main_source.push_str("#include <metal_simdgroup>\n");
+        main_source.push_str("#include <metal_simdgroup_matrix>\n");
+        main_source.push_str("\nusing namespace metal;\n\n");
+
+        // Process only the top-level files that contain kernel definitions
+        // The implementation files (_impl.metal) and utility files will be included
+        // automatically through the preprocessor when processing these files
+        // Note: bf16.metal is excluded as it only contains type definitions that
+        // are already in utils.metal, which would cause duplicate definitions
+        let main_files = vec![
+            "bitwise.metal",        // Bitwise operations
+            "blockwise_fp8.metal",  // FP8 blockwise operations (includes float8.metal, utils.metal)
+            "bnb_dequantize.metal", // BitsAndBytes dequantization (includes utils.metal)
+            "hqq_dequantize.metal", // HQQ dequantization
+            "quantized.metal",      // Quantization operations (includes utils.metal)
+            "copy.metal",           // Copy operations (includes utils.metal, copy_impl.metal)
+            "scan.metal",           // Scan operations (includes utils.metal, scan_impl.metal)
+            "sort.metal",           // Sort operations (includes utils.metal, sort_impl.metal)
+        ];
+
+        for file in main_files {
+            if !included_files.contains(file) {
+                if let Some(content) = file_system.get(file) {
+                    match preprocess_includes(
+                        content,
+                        file,
+                        &file_system,
+                        &mut included_files,
+                        &mut include_stack,
+                    ) {
+                        Ok(processed) => {
+                            main_source.push_str(&format!("\n// ===== {file} =====\n"));
+                            main_source.push_str(&processed);
+                        }
+                        Err(e) => {
+                            return Err(MetalKernelError::CompilationError(format!(
+                                "Failed to preprocess {file}: {e}"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Compile the preprocessed source
+        let compile_options = metal::CompileOptions::new();
+        device
+            .new_library_with_source(&main_source, &compile_options)
+            .map_err(|e| {
+                MetalKernelError::CompilationError(format!(
+                    "Failed to compile Metal kernels at runtime: {e}"
+                ))
+            })
     }
 
     fn load_function(
@@ -665,6 +852,7 @@ pub fn call_affine_quantize(
     let packs_per_int = match bits {
         3 => 8,
         6 => 4,
+        40 => 2, // mxfp4: 2 FP4 values per byte
         _ => 8 / bits,
     };
     let per_thread = if dequantize {
@@ -718,6 +906,7 @@ pub fn call_afq_qmm(
     kernels: &Kernels,
     ty: DType,
     x: &Buffer,
+    x_offset: usize,
     x_shape: &[usize],
     x_stride: &[usize],
     w: &Buffer,
@@ -910,7 +1099,7 @@ pub fn call_afq_qmm(
     encoder.set_buffer(0, Some(w), 0);
     encoder.set_buffer(1, Some(scales), 0);
     encoder.set_buffer(2, Some(biases), 0);
-    encoder.set_buffer(3, Some(x), 0);
+    encoder.set_buffer(3, Some(x), x_offset as u64);
     encoder.set_buffer(4, Some(out), 0);
     <i32 as EncoderParam>::set_param(encoder, 5, d as i32);
     <i32 as EncoderParam>::set_param(encoder, 6, o as i32);
@@ -1526,7 +1715,7 @@ fn call_copy_gpu_inplace(
         if shape.len() <= MAX_COPY_SPECIALIZED_DIMS {
             kernel_name.push_str(&shape.len().to_string());
         } else {
-            kernel_name.push_str(&format!("n{}", work_per_thread));
+            kernel_name.push_str(&format!("n{work_per_thread}"));
         }
         if large {
             kernel_name.push_str("large");
@@ -2066,4 +2255,167 @@ pub fn call_argsort<'a>(
     cache: &MultiBlockSortCache,
 ) -> Result<(), MetalKernelError> {
     call_block_sort(device, ep, kernels, args, /* argsort = */ true, cache)
+}
+
+// HQQ Bitpacking functions
+
+pub fn call_hqq_pack_8bit(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    input: &Buffer,
+    output: &Buffer,
+    num_elements: usize,
+) -> Result<(), MetalKernelError> {
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    let pipeline = kernels.load_pipeline(device, "pack_8bit")?;
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(encoder, (input, output, num_elements as u64));
+
+    let grid_size = MTLSize {
+        width: ((num_elements + 255) / 256) as u64,
+        height: 1,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: 256,
+        height: 1,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(grid_size, threadgroup_size);
+    Ok(())
+}
+
+pub fn call_hqq_pack_4bit(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    input: &Buffer,
+    output: &Buffer,
+    height: usize,
+    width: usize,
+) -> Result<(), MetalKernelError> {
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    let pipeline = kernels.load_pipeline(device, "pack_4bit")?;
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(encoder, (input, output, height as u64, width as u64));
+
+    let step = height / 2;
+    let grid_size = MTLSize {
+        width: ((step + 15) / 16) as u64,
+        height: ((width + 15) / 16) as u64,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: 16,
+        height: 16,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(grid_size, threadgroup_size);
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn call_hqq_pack_2bit(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    input: &Buffer,
+    output: &Buffer,
+    height: usize,
+    width: usize,
+) -> Result<(), MetalKernelError> {
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    let pipeline = kernels.load_pipeline(device, "pack_2bit")?;
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(encoder, (input, output, height as u64, width as u64));
+
+    let step = height / 4;
+    let grid_size = MTLSize {
+        width: ((step + 15) / 16) as u64,
+        height: ((width + 15) / 16) as u64,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: 16,
+        height: 16,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(grid_size, threadgroup_size);
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn call_hqq_pack_3bit(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    input: &Buffer,
+    output: &Buffer,
+    height: usize,
+    width: usize,
+) -> Result<(), MetalKernelError> {
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    let pipeline = kernels.load_pipeline(device, "pack_3bit")?;
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(encoder, (input, output, height as u64, width as u64));
+
+    let step = height / 10;
+    let grid_size = MTLSize {
+        width: ((step + 15) / 16) as u64,
+        height: ((width + 15) / 16) as u64,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: 16,
+        height: 16,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(grid_size, threadgroup_size);
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn call_hqq_pack_1bit(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    input: &Buffer,
+    output: &Buffer,
+    height: usize,
+    width: usize,
+) -> Result<(), MetalKernelError> {
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoderRef = encoder.as_ref();
+    let pipeline = kernels.load_pipeline(device, "pack_1bit")?;
+    encoder.set_compute_pipeline_state(&pipeline);
+
+    set_params!(encoder, (input, output, height as u64, width as u64));
+
+    let step = height / 8;
+    let grid_size = MTLSize {
+        width: ((step + 15) / 16) as u64,
+        height: ((width + 15) / 16) as u64,
+        depth: 1,
+    };
+    let threadgroup_size = MTLSize {
+        width: 16,
+        height: 16,
+        depth: 1,
+    };
+
+    encoder.dispatch_thread_groups(grid_size, threadgroup_size);
+    Ok(())
 }

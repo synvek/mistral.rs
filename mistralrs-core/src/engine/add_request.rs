@@ -33,6 +33,8 @@ impl Engine {
                     request.messages,
                     RequestMessage::Chat { .. } | RequestMessage::VisionChat { .. }
                 ) && request.web_search_options.is_some()
+                    || !self.tool_callbacks.is_empty()
+                    || !self.tool_callbacks_with_tools.is_empty()
                 {
                     search_request::search_request(self.clone(), *request).await;
                 } else {
@@ -121,7 +123,18 @@ impl Engine {
                 ref images,
                 messages: _,
                 enable_thinking: _,
+                audios: _,
             } => Some(images.clone()),
+            _ => None,
+        };
+
+        let audios = match request.messages {
+            RequestMessage::VisionChat {
+                images: _,
+                messages: _,
+                enable_thinking: _,
+                ref audios,
+            } => Some(audios.clone()),
             _ => None,
         };
 
@@ -156,6 +169,7 @@ impl Engine {
             }
             | RequestMessage::VisionChat {
                 images: _,
+                audios: _,
                 messages,
                 enable_thinking,
             } => {
@@ -379,7 +393,7 @@ impl Engine {
                     request
                         .response
                         .send(Response::ValidationError(
-                            format!("Invalid grammar. {}", err).into(),
+                            format!("Invalid grammar. {err}").into(),
                         ))
                         .await
                         .unwrap_or_else(|_| warn!("Receiver disconnected"));
@@ -496,6 +510,7 @@ impl Engine {
                     None
                 },
                 images.clone(),
+                audios.clone(),
                 block_size,
                 Some(matcher.clone()),
                 image_generation_format,
@@ -512,7 +527,7 @@ impl Engine {
             }
 
             // Run the inputs processor to update the prompt for multimodal models.
-            if images.is_some() {
+            if images.is_some() || audios.is_some() {
                 let pipeline = get_mut_arcmutex!(self.pipeline);
                 let _ = pipeline.get_processor().inputs_processor().process_inputs(
                     pipeline.tokenizer(),
@@ -525,7 +540,6 @@ impl Engine {
                     false,
                     pipeline.get_input_processor_config(),
                     None,
-                    pipeline.get_metadata().prompt_chunksize,
                     pipeline.device_mapper(),
                 );
             }
@@ -534,7 +548,7 @@ impl Engine {
                 get_mut_arcmutex!(self.prefix_cacher).search_for_matching_cache(
                     seq.get_toks(),
                     seq.image_hashes(),
-                    images.as_ref().is_some_and(|x| !x.is_empty())
+                    seq.audio_hashes(),
                 ),
                 request.response
             );
@@ -543,24 +557,28 @@ impl Engine {
                 Some(MatchingCache::Normal {
                     normal,
                     images_to_keep,
+                    audios_to_keep,
                     toks,
                     offset,
                 }) => {
                     self.logger.add_prefix_cache_hit();
 
                     seq.keep_num_images(images_to_keep);
+                    seq.keep_num_audios(audios_to_keep);
                     seq.prefill_v2_normal(normal, toks, offset)
                 }
                 Some(MatchingCache::Paged {
                     logical_blocks,
                     physical_blocks,
                     images_to_keep,
+                    audios_to_keep,
                     toks,
                     offset,
                 }) => {
                     self.logger.add_prefix_cache_hit();
 
                     seq.keep_num_images(images_to_keep);
+                    seq.keep_num_audios(audios_to_keep);
                     seq.prefill_v2_paged(logical_blocks, physical_blocks, toks, offset)
                 }
                 None => seq,

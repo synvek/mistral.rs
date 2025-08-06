@@ -15,6 +15,8 @@ use std::path::Path;
 use std::sync::Arc;
 use tracing::error;
 
+use mistralrs::AudioInput;
+
 use crate::chat::append_chat_message;
 use crate::models::LoadedModel;
 use crate::types::AppState;
@@ -25,6 +27,7 @@ const CLEAR_CMD: &str = "__CLEAR__";
 pub struct VisionContext<'a> {
     pub msgs: &'a mut VisionMessages,
     pub image_buffer: &'a mut Vec<image::DynamicImage>,
+    pub audio_buffer: &'a mut Vec<AudioInput>,
 }
 
 /// Aggregates frequently used parameters so that helper functions stay below
@@ -64,7 +67,11 @@ where
                 if let mistralrs::Response::Chunk(resp) = chunk {
                     if let Some(choice) = resp.choices.first() {
                         if let Some(token) = &choice.delta.content {
-                            if socket.send(Message::Text(token.clone())).await.is_err() {
+                            if socket
+                                .send(Message::Text(token.clone().into()))
+                                .await
+                                .is_err()
+                            {
                                 break;
                             }
                             assistant_reply.push_str(token);
@@ -77,7 +84,9 @@ where
             Ok(())
         }
         Err(e) => {
-            let _ = socket.send(Message::Text(format!("Error: {}", e))).await;
+            let _ = socket
+                .send(Message::Text(format!("Error: {e}").into()))
+                .await;
             Err(e)
         }
     }
@@ -113,11 +122,37 @@ fn validate_image_path(path: &str) -> Result<String, &'static str> {
     }
 }
 
+fn validate_audio_path(path: &str) -> Result<String, &'static str> {
+    // Same safety check as images
+    let uploads_dir = get_cache_dir().join("uploads");
+    let uploads_path = uploads_dir.as_path();
+
+    let file_path = Path::new(path);
+    if !file_path.is_absolute() {
+        return Err("Path must be absolute");
+    }
+
+    match file_path.canonicalize() {
+        Ok(canonical_path) => match uploads_path.canonicalize() {
+            Ok(canonical_uploads) => {
+                if canonical_path.starts_with(canonical_uploads) {
+                    Ok(path.to_string())
+                } else {
+                    Err("Path is outside uploads directory")
+                }
+            }
+            Err(_) => Err("Uploads directory not found"),
+        },
+        Err(_) => Err("Invalid file path"),
+    }
+}
+
 /// Per-connection task.
 pub async fn handle_socket(mut socket: WebSocket, app: Arc<AppState>) {
     let mut text_msgs = TextMessages::new();
     let mut vision_msgs = VisionMessages::new();
     let mut image_buffer: Vec<image::DynamicImage> = Vec::new();
+    let mut audio_buffer: Vec<AudioInput> = Vec::new();
     // `true` while we are streaming a reply back to the client.
     let mut streaming = false;
     // Track per-connection chat ID; set by client via WebSocket control
@@ -173,10 +208,9 @@ pub async fn handle_socket(mut socket: WebSocket, app: Arc<AppState>) {
                         Ok(opts) => Some(opts),
                         Err(e) => {
                             let _ = socket
-                                .send(Message::Text(format!(
-                                    "Error parsing web_search_options: {}",
-                                    e
-                                )))
+                                .send(Message::Text(
+                                    format!("Error parsing web_search_options: {e}").into(),
+                                ))
                                 .await;
                             None
                         }
@@ -221,6 +255,7 @@ pub async fn handle_socket(mut socket: WebSocket, app: Arc<AppState>) {
                         let mut vision_ctx = VisionContext {
                             msgs: &mut vision_msgs,
                             image_buffer: &mut image_buffer,
+                            audio_buffer: &mut audio_buffer,
                         };
                         let mut params = HandlerParams {
                             socket: &mut socket,
@@ -279,6 +314,7 @@ pub async fn handle_socket(mut socket: WebSocket, app: Arc<AppState>) {
                 let mut vision_ctx = VisionContext {
                     msgs: &mut vision_msgs,
                     image_buffer: &mut image_buffer,
+                    audio_buffer: &mut audio_buffer,
                 };
                 let mut params = HandlerParams {
                     socket: &mut socket,
@@ -348,8 +384,7 @@ async fn handle_restore_message(
                                                 if let Some(idx) = src.find(',') {
                                                     let b64_data = &src[idx + 1..];
                                                     imgs_b64.push(format!(
-                                                        "data:image/png;base64,{}",
-                                                        b64_data
+                                                        "data:image/png;base64,{b64_data}"
                                                     ));
                                                     if let Ok(img_bytes) =
                                                         BASE64.decode(b64_data.as_bytes())
@@ -456,7 +491,7 @@ async fn handle_vision_model(
     let mut msgs_for_stream: Option<VisionMessages> = None;
     // --- Vision input routing ---
     if let Ok(val) = serde_json::from_str::<Value>(user_msg) {
-        // Case 1: pure image payload => buffer it and wait for a prompt
+        // Case 1a: pure image payload => buffer it and wait for a prompt
         if let Some(url) = val.get("image").and_then(|v| v.as_str()) {
             match validate_image_path(url) {
                 Ok(safe_path) => {
@@ -468,23 +503,61 @@ async fn handle_vision_model(
                             }
                             Err(e) => {
                                 error!("image decode error: {}", e);
-                                let _ = socket.send(Message::Text(format!("Error: {}", e))).await;
+                                let _ = socket
+                                    .send(Message::Text(format!("Error: {e}").into()))
+                                    .await;
                             }
                         },
                         Err(e) => {
                             error!("image read error: {}", e);
-                            let _ = socket.send(Message::Text(format!("Error: {}", e))).await;
+                            let _ = socket
+                                .send(Message::Text(format!("Error: {e}").into()))
+                                .await;
                         }
                     }
                 }
                 Err(e) => {
                     error!("Invalid image path: {}", e);
                     let _ = socket
-                        .send(Message::Text(format!("Error: Invalid image path - {}", e)))
+                        .send(Message::Text(
+                            format!("Error: Invalid image path - {e}").into(),
+                        ))
                         .await;
                 }
             }
             // Skip sending to model until we get a prompt
+            return;
+        // Case 1b: pure audio payload => buffer and wait for prompt
+        } else if let Some(url) = val.get("audio").and_then(|v| v.as_str()) {
+            match validate_audio_path(url) {
+                Ok(safe_path) => match tokio::fs::read(&safe_path).await {
+                    Ok(bytes) => match AudioInput::from_bytes(&bytes) {
+                        Ok(audio) => {
+                            vision_ctx.audio_buffer.push(audio);
+                        }
+                        Err(e) => {
+                            error!("audio decode error: {}", e);
+                            let _ = socket
+                                .send(Message::Text(format!("Error: {e}").into()))
+                                .await;
+                        }
+                    },
+                    Err(e) => {
+                        error!("audio read error: {}", e);
+                        let _ = socket
+                            .send(Message::Text(format!("Error: {e}").into()))
+                            .await;
+                    }
+                },
+                Err(e) => {
+                    error!("Invalid audio path: {}", e);
+                    let _ = socket
+                        .send(Message::Text(
+                            format!("Error: Invalid audio path - {e}").into(),
+                        ))
+                        .await;
+                }
+            }
             return;
         } else {
             // Fallback: treat whole JSON as text
@@ -501,7 +574,7 @@ async fn handle_vision_model(
         }
     } else {
         // Plain-text prompt arrives here
-        if vision_ctx.image_buffer.is_empty() {
+        if vision_ctx.image_buffer.is_empty() && vision_ctx.audio_buffer.is_empty() {
             *vision_ctx.msgs = vision_ctx
                 .msgs
                 .clone()
@@ -514,10 +587,12 @@ async fn handle_vision_model(
                 }
             }
         } else {
-            match vision_ctx.msgs.clone().add_image_message(
+            // Prepare multimodal message with images and/or audios
+            match vision_ctx.msgs.clone().add_multimodal_message(
                 TextMessageRole::User,
                 user_msg,
                 vision_ctx.image_buffer.clone(),
+                vision_ctx.audio_buffer.clone(),
                 model,
             ) {
                 Ok(updated) => {
@@ -541,18 +616,30 @@ async fn handle_vision_model(
                         }
                     }
                     if let Some(chat_id) = active_chat_id {
-                        if let Err(e) =
-                            append_chat_message(app, chat_id, "user", user_msg, Some(imgs_b64))
-                                .await
+                        if let Err(e) = append_chat_message(
+                            app,
+                            chat_id,
+                            "user",
+                            user_msg,
+                            if imgs_b64.is_empty() {
+                                None
+                            } else {
+                                Some(imgs_b64)
+                            },
+                        )
+                        .await
                         {
                             error!("chat save error: {}", e);
                         }
                     }
                     vision_ctx.image_buffer.clear();
+                    vision_ctx.audio_buffer.clear();
                 }
                 Err(e) => {
                     error!("image prompt error: {}", e);
-                    let _ = socket.send(Message::Text(format!("Error: {}", e))).await;
+                    let _ = socket
+                        .send(Message::Text(format!("Error: {e}").into()))
+                        .await;
                 }
             }
         }

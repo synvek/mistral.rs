@@ -172,6 +172,7 @@ async fn main() -> Result<()> {
         .route("/ws", get(ws_handler))
         .route("/api/upload_image", post(upload_image))
         .route("/api/upload_text", post(upload_text))
+        .route("/api/upload_audio", post(upload_audio))
         .route("/api/list_models", get(list_models))
         .route("/api/select_model", post(select_model))
         .route("/api/list_chats", get(list_chats))
@@ -186,13 +187,13 @@ async fn main() -> Result<()> {
         .nest_service("/speech", get_service(ServeDir::new(speech_dir.clone())))
         // Serve embedded static assets for the root path
         .route("/", get(static_handler))
-        .route("/*path", get(static_handler))
+        .route("/{*path}", get(static_handler))
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .with_state(app_state.clone());
 
     let addr: SocketAddr = ([0, 0, 0, 0], cli.port.unwrap_or(8080)).into();
     let listener = TcpListener::bind(addr).await?;
-    println!("🔌 listening on http://{}", addr);
+    println!("🔌 listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
 }

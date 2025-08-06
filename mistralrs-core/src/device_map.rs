@@ -160,7 +160,7 @@ impl DeviceMapSetting {
                                 if device_ord == *ordinal {
                                     device.clone()
                                 } else {
-                                    Device::new_cuda_with_stream(*ordinal)?
+                                    Device::new_cuda(*ordinal)?
                                 }
                             }
                             DeviceLocation::Metal { gpu_id: device_ord } => {
@@ -336,7 +336,7 @@ impl DeviceMapper for LayerDeviceMapper {
 
 #[derive(Debug)]
 pub struct DummyDeviceMapper {
-    nm_device: Device,
+    pub(crate) nm_device: Device,
 }
 
 impl DeviceMapper for DummyDeviceMapper {

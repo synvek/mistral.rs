@@ -37,13 +37,14 @@ use llguidance::toktrie::TokEnv;
 pub use loaders::{
     AdapterKind, AutoDeviceMapParams, AutoNormalLoader, AutoVisionLoader, DeepSeekV2Loader,
     DeepSeekV3Loader, DeviceMappedModelLoader, DiffusionLoaderType, DiffusionModel,
-    DiffusionModelLoader, FluxLoader, Gemma2Loader, Gemma3Loader, GemmaLoader, Idefics2Loader,
-    Idefics3Loader, LLaVALoader, LLaVANextLoader, LlamaLoader, Loader, LocalModelPaths,
-    MiniCpmOLoader, Mistral3Loader, MistralLoader, MixtralLoader, ModelKind, ModelPaths,
-    NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader, Phi2Loader,
-    Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader, PrettyName, QuantizationKind,
-    Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader, Qwen3Loader, Qwen3MoELoader, Starcoder2Loader,
-    TokenSource, VLlama4Loader, VLlamaLoader, VisionLoaderType, VisionModel, VisionModelLoader,
+    DiffusionModelLoader, FluxLoader, GLM4Loader, Gemma2Loader, Gemma3Loader, Gemma3nLoader,
+    GemmaLoader, Idefics2Loader, Idefics3Loader, LLaVALoader, LLaVANextLoader, LlamaLoader, Loader,
+    LocalModelPaths, MiniCpmOLoader, Mistral3Loader, MistralLoader, MixtralLoader, ModelKind,
+    ModelPaths, NormalLoaderType, NormalLoadingMetadata, NormalModel, NormalModelLoader,
+    Phi2Loader, Phi3Loader, Phi3VLoader, Phi3_5MoELoader, Phi4MMLoader, PrettyName,
+    QuantizationKind, Qwen2Loader, Qwen2VLLoader, Qwen2_5VLLoader, Qwen3Loader, Qwen3MoELoader,
+    SmolLm3Loader, Starcoder2Loader, TokenSource, VLlama4Loader, VLlamaLoader, VisionLoaderType,
+    VisionModel, VisionModelLoader,
 };
 use mistralrs_quant::IsqType;
 pub use normal::{NormalLoader, NormalLoaderBuilder, NormalSpecificConfig};
@@ -57,7 +58,7 @@ pub use speculative::{SpeculativeConfig, SpeculativeLoader, SpeculativePipeline}
 pub use speech::{SpeechLoader, SpeechPipeline};
 use std::any::Any;
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
+use std::fmt::Debug;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokenizers::Tokenizer;
@@ -76,6 +77,29 @@ pub use crate::kv_cache::{
     Cache, CacheManager, EitherCache, KvCache, LayerCaches, NormalCache, NormalCacheType,
 };
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum SupportedModality {
+    Text,
+    Audio,
+    Vision,
+}
+
+impl Debug for SupportedModality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text => write!(f, "📝 Text"),
+            Self::Audio => write!(f, "🔊 Audio"),
+            Self::Vision => write!(f, "🖼️ Vision"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Modalities {
+    pub input: Vec<SupportedModality>,
+    pub output: Vec<SupportedModality>,
+}
+
 pub struct GeneralMetadata {
     pub max_seq_len: usize,
     /// Only None if it doesn't make sense for the model
@@ -92,8 +116,8 @@ pub struct GeneralMetadata {
     // PagedAttention stuff
     pub cache_config: Option<CacheConfig>,
     pub cache_engine: Option<CacheEngine>,
-    pub prompt_chunksize: Option<NonZeroUsize>,
     pub model_metadata: Option<Arc<dyn ModelConfigLike + Send + Sync>>,
+    pub modalities: Modalities,
 }
 
 impl GeneralMetadata {
@@ -219,7 +243,7 @@ pub trait AnyMoePipelineMixin {
 pub enum ModelCategory {
     Text,
     Vision {
-        prefixer: Arc<dyn VisionPromptPrefixer>,
+        prefixer: Arc<dyn MultimodalPromptPrefixer>,
     },
     Diffusion,
     Audio,
@@ -255,9 +279,15 @@ impl PartialEq for ModelCategory {
 }
 
 /// Prepend a vision tag appropriate for the model to the prompt. Image indexing is assumed that start at 0.
-pub trait VisionPromptPrefixer: Send + Sync {
+pub trait MultimodalPromptPrefixer: Send + Sync {
     /// Prefix for inclusion in messages (may do nothing if the chat template handles it).
-    fn prefix_image(&self, image_indices: Vec<usize>, prompt: &str) -> String;
+    fn prefix_image(&self, _image_indices: Vec<usize>, prompt: &str) -> String {
+        prompt.to_string()
+    }
+    /// Prefix for inclusion in messages (may do nothing if the chat template handles it).
+    fn prefix_audio(&self, _audio_indexes: Vec<usize>, prompt: &str) -> String {
+        prompt.to_string()
+    }
 }
 
 pub enum CacheBackendMetadata {
@@ -329,6 +359,11 @@ impl ForwardInputsResult {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(crate) struct FileListCache {
+    files: Vec<String>,
+}
+
 #[async_trait::async_trait]
 pub trait Pipeline:
     Send
@@ -359,32 +394,23 @@ pub trait Pipeline:
     ) -> Result<Duration, candle_core::Error> {
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
-                let inputs_iter = self.get_processor().inputs_processor().process_inputs(
-                    self.tokenizer(),
-                    input_seqs,
-                    is_prompt,
-                    self.get_metadata().is_xlora,
-                    &self.device(),
-                    self.get_metadata().no_kv_cache,
-                    None,
-                    return_raw_logits,
-                    self.get_input_processor_config(),
-                    None,
-                    self.get_metadata().prompt_chunksize,
-                    self.device_mapper(),
-                );
+                let inputs_iter =
+                    std::iter::once(self.get_processor().inputs_processor().process_inputs(
+                        self.tokenizer(),
+                        input_seqs,
+                        is_prompt,
+                        self.get_metadata().is_xlora,
+                        &self.device(),
+                        self.get_metadata().no_kv_cache,
+                        None,
+                        return_raw_logits,
+                        self.get_input_processor_config(),
+                        None,
+                        self.device_mapper(),
+                    ));
 
                 let mut logits = vec![None; input_seqs.len()];
-                let prompt_chunksize = self
-                    .get_metadata()
-                    .prompt_chunksize
-                    .map(NonZeroUsize::get)
-                    .unwrap_or(1);
-                let len_inputs = input_seqs
-                    .iter()
-                    .map(|seq| seq.get_toks().len().div_ceil(prompt_chunksize))
-                    .max()
-                    .unwrap();
+                let len_inputs = 1;
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
 
                 let mut exec_duration = Duration::ZERO;
@@ -581,32 +607,23 @@ pub trait Pipeline:
                         &blocks_to_copy,
                     )?;
 
-                let inputs_iter = self.get_processor().inputs_processor().process_inputs(
-                    self.tokenizer(),
-                    input_seqs,
-                    is_prompt,
-                    self.get_metadata().is_xlora,
-                    &self.device(),
-                    self.get_metadata().no_kv_cache,
-                    None,
-                    return_raw_logits,
-                    self.get_input_processor_config(),
-                    Some(metadata),
-                    self.get_metadata().prompt_chunksize,
-                    self.device_mapper(),
-                );
+                let inputs_iter =
+                    std::iter::once(self.get_processor().inputs_processor().process_inputs(
+                        self.tokenizer(),
+                        input_seqs,
+                        is_prompt,
+                        self.get_metadata().is_xlora,
+                        &self.device(),
+                        self.get_metadata().no_kv_cache,
+                        None,
+                        return_raw_logits,
+                        self.get_input_processor_config(),
+                        Some(metadata),
+                        self.device_mapper(),
+                    ));
 
                 let mut logits = vec![None; input_seqs.len()];
-                let prompt_chunksize = self
-                    .get_metadata()
-                    .prompt_chunksize
-                    .map(NonZeroUsize::get)
-                    .unwrap_or(1);
-                let len_inputs = input_seqs
-                    .iter()
-                    .map(|seq| seq.get_toks().len().div_ceil(prompt_chunksize))
-                    .max()
-                    .unwrap();
+                let len_inputs = 1;
                 let mut raw_out_logits = vec![vec![None; len_inputs]; input_seqs.len()];
 
                 let mut exec_duration = Duration::ZERO;

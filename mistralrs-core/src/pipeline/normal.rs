@@ -1,4 +1,3 @@
-use super::inputs_processor::DEFAULT_PROMPT_CHUNK_SIZE;
 use super::isq::ImatrixDataSource;
 use super::llg::build_llg_factory;
 use super::{
@@ -11,23 +10,24 @@ use super::{
     IsqPipelineMixin, MetadataMixin, ModelCategory, PreProcessingMixin,
 };
 use super::{
-    AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, Gemma2Loader, GemmaLoader, LlamaLoader,
-    MistralLoader, MixtralLoader, NormalLoaderType, Phi2Loader, Phi3Loader, Phi3_5MoELoader,
-    Qwen2Loader, Qwen3Loader, Qwen3MoELoader, Starcoder2Loader,
+    AutoNormalLoader, DeepSeekV2Loader, DeepSeekV3Loader, GLM4Loader, Gemma2Loader, GemmaLoader,
+    LlamaLoader, MistralLoader, MixtralLoader, NormalLoaderType, Phi2Loader, Phi3Loader,
+    Phi3_5MoELoader, Qwen2Loader, Qwen3Loader, Qwen3MoELoader, SmolLm3Loader, Starcoder2Loader,
 };
 use crate::amoe::AnyMoeExpertType;
+use crate::attention::ATTENTION_CHUNK_SIZE;
 use crate::device_map::{self, DeviceMapper};
 use crate::distributed::{self, WorkerTransferData};
 use crate::kv_cache::{FullCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
 use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
 use crate::pipeline::chat_template::{calculate_eos_tokens, GenerationConfig};
-use crate::pipeline::get_chat_template;
 use crate::pipeline::isq::UqffFullSer;
 use crate::pipeline::loaders::auto_device_map;
 use crate::pipeline::loaders::QuantizationConfigShim;
 use crate::pipeline::sampling::sample_and_add_toks;
 use crate::pipeline::text_models_inputs_processor::make_prompt_chunk;
+use crate::pipeline::{get_chat_template, Modalities, SupportedModality};
 use crate::pipeline::{ChatTemplate, LocalModelPaths};
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
@@ -51,7 +51,6 @@ use rand_isaac::Isaac64Rng;
 use regex_automata::meta::Regex;
 use std::any::Any;
 use std::borrow::Cow;
-use std::num::{NonZero, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, RwLock};
@@ -120,7 +119,6 @@ pub struct NormalLoaderBuilder {
 #[derive(Clone, Default)]
 /// Config specific to loading a normal model.
 pub struct NormalSpecificConfig {
-    pub prompt_chunksize: Option<NonZeroUsize>,
     pub topology: Option<Topology>,
     pub organization: IsqOrganization,
     pub write_uqff: Option<PathBuf>,
@@ -128,6 +126,8 @@ pub struct NormalSpecificConfig {
     pub imatrix: Option<PathBuf>,
     pub calibration_file: Option<PathBuf>,
     pub hf_cache_path: Option<PathBuf>,
+    pub matformer_config_path: Option<PathBuf>,
+    pub matformer_slice_name: Option<String>,
 }
 
 impl NormalLoaderBuilder {
@@ -227,7 +227,9 @@ impl NormalLoaderBuilder {
             Some(NormalLoaderType::DeepSeekV2) => Box::new(DeepSeekV2Loader),
             Some(NormalLoaderType::DeepSeekV3) => Box::new(DeepSeekV3Loader),
             Some(NormalLoaderType::Qwen3) => Box::new(Qwen3Loader),
+            Some(NormalLoaderType::GLM4) => Box::new(GLM4Loader),
             Some(NormalLoaderType::Qwen3Moe) => Box::new(Qwen3MoELoader),
+            Some(NormalLoaderType::SmolLm3) => Box::new(SmolLm3Loader),
             None => Box::new(AutoNormalLoader),
         };
         Ok(Box::new(NormalLoader {
@@ -317,14 +319,7 @@ impl Loader for NormalLoader {
             paged_attn_config = None;
         }
 
-        // Apply default prompt size here
-        let prompt_chunksize = self
-            .config
-            .prompt_chunksize
-            .unwrap_or(DEFAULT_PROMPT_CHUNK_SIZE.try_into().unwrap())
-            .get();
-
-        info!("Prompt chunk size is {prompt_chunksize}.",);
+        info!("Prompt chunk size is {ATTENTION_CHUNK_SIZE}.");
 
         let use_nccl = mistralrs_quant::distributed::use_nccl();
 
@@ -394,12 +389,18 @@ impl Loader for NormalLoader {
                         total_pack_factors / total_tensors
                     };
 
-                    let layer_sizes_in_bytes =
-                        self.inner
-                            .layer_sizes_in_bytes(&config, dtype, weight_pack_factor)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner
-                            .non_mapped_size_in_bytes(&config, dtype, weight_pack_factor)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -408,12 +409,18 @@ impl Loader for NormalLoader {
                     )
                 } else if let Some(isq) = in_situ_quant {
                     let weight_pack_factor = isq.pack_factor(dtype);
-                    let layer_sizes_in_bytes =
-                        self.inner
-                            .layer_sizes_in_bytes(&config, dtype, weight_pack_factor)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner
-                            .non_mapped_size_in_bytes(&config, dtype, weight_pack_factor)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -424,12 +431,18 @@ impl Loader for NormalLoader {
                     // Be sure to get the weight pack factor here; we might be loading a prequantized model.
                     let weight_pack_factor =
                         QuantizationConfigShim::get_quant_config_pack_factor(&config, dtype)?;
-                    let layer_sizes_in_bytes =
-                        self.inner
-                            .layer_sizes_in_bytes(&config, dtype, weight_pack_factor)?;
-                    let non_mapped_size_in_bytes =
-                        self.inner
-                            .non_mapped_size_in_bytes(&config, dtype, weight_pack_factor)?;
+                    let layer_sizes_in_bytes = self.inner.layer_sizes_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
+                    let non_mapped_size_in_bytes = self.inner.non_mapped_size_in_bytes(
+                        &config,
+                        dtype,
+                        weight_pack_factor,
+                        None,
+                    )?;
                     let layer_sizes_sum = layer_sizes_in_bytes.iter().sum::<usize>();
                     (
                         layer_sizes_in_bytes,
@@ -448,7 +461,6 @@ impl Loader for NormalLoader {
                 &available_devices,
                 dtype,
                 &params,
-                prompt_chunksize,
                 paged_attn_config.as_ref(),
             )?;
             mapper = DeviceMapSetting::Map(new);
@@ -474,7 +486,7 @@ impl Loader for NormalLoader {
         // TODO: PagedAttention is not supported with CPU for now.
         // This check is not really necessary because `get_device_layers` should prevent it.
         let mapping_uses_cpu = mapper.get_unique_devices().iter().any(Device::is_cpu);
-        if mapping_uses_cpu {
+        if mapping_uses_cpu && paged_attn_config.is_some() {
             warn!("Device mapping contains a mix of GPU and CPU. There is no CPU support for PagedAttention, disabling PagedAttention.");
             paged_attn_config = None;
         }
@@ -538,6 +550,27 @@ impl Loader for NormalLoader {
 
         let multi_progress = Arc::new(MultiProgress::new());
 
+        // Load matformer slicing config if provided
+        let matformer_slicing_config = if let Some(matformer_path) =
+            &self.config.matformer_config_path
+        {
+            use crate::matformer::{MatformerConfig, MatformerSliceConfig};
+            info!("Loading Matformer config from {:?}", matformer_path);
+            let config = Arc::new(MatformerConfig::from_file(matformer_path)?);
+
+            if let Some(slice_name) = &self.config.matformer_slice_name {
+                info!("Using Matformer slice: {}", slice_name);
+                Some(MatformerSliceConfig::new(slice_name.clone(), config))
+            } else {
+                // If no slice name is provided but config exists, we'll need to handle this
+                // For now, return None and let the model handle the default slice selection
+                warn!("Matformer config loaded but no slice name specified. Models will use their default slice.");
+                None
+            }
+        } else {
+            None
+        };
+
         let mut model = if use_nccl || cfg!(feature = "ring") {
             let (mapper, sharded_vb) = distributed::prepare_distributed_mapper(
                 dtype,
@@ -563,6 +596,7 @@ impl Loader for NormalLoader {
                     device.clone(),
                     attention_mechanism,
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::XLora,
@@ -578,6 +612,7 @@ impl Loader for NormalLoader {
                     loading_isq,
                     device.clone(),
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::Lora,
@@ -596,6 +631,7 @@ impl Loader for NormalLoader {
                     attention_mechanism,
                     matches!(self.config.organization, IsqOrganization::MoeExpertsOnly),
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 _ => unreachable!(),
             }
@@ -616,6 +652,7 @@ impl Loader for NormalLoader {
                     attention_mechanism,
                     matches!(self.config.organization, IsqOrganization::MoeExpertsOnly),
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::XLora,
@@ -631,6 +668,7 @@ impl Loader for NormalLoader {
                     loading_isq,
                     device.clone(),
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 ModelKind::Adapter {
                     adapter: AdapterKind::Lora,
@@ -649,15 +687,21 @@ impl Loader for NormalLoader {
                     attention_mechanism,
                     matches!(self.config.organization, IsqOrganization::MoeExpertsOnly),
                     multi_progress.clone(),
+                    matformer_slicing_config.clone(),
                 ),
                 _ => unreachable!(),
             }
         };
 
         let tokenizer = get_tokenizer(paths.get_tokenizer_filename(), None)?;
-        let gen_conf: Option<GenerationConfig> = paths.get_gen_conf_filename().map(|f| {
-            serde_json::from_str(&fs::read_to_string(f).unwrap())
-                .expect("bos_token_id/eos_token_id missing in generation_config.json")
+        let gen_conf: Option<GenerationConfig> = paths.get_gen_conf_filename().and_then(|f| {
+            match serde_json::from_str::<GenerationConfig>(&fs::read_to_string(f).unwrap()) {
+                Ok(conf) => Some(conf),
+                Err(e) => {
+                    warn!("Failed to parse generation_config.json: {}", e);
+                    None
+                }
+            }
         });
 
         let chat_template_explicit = paths
@@ -814,6 +858,7 @@ impl Loader for NormalLoader {
                 paged_attn_config.mem_cpu,
                 paged_attn_config.block_size,
                 dtype,
+                paged_attn_config.cache_type,
                 model.config(),
                 &device,
                 &pipeline_mapper
@@ -877,8 +922,11 @@ impl Loader for NormalLoader {
                 sliding_window,
                 cache_config,
                 cache_engine,
-                prompt_chunksize: Some(NonZero::new(prompt_chunksize).unwrap()),
                 model_metadata: Some(model_metadata),
+                modalities: Modalities {
+                    input: vec![SupportedModality::Text],
+                    output: vec![SupportedModality::Text],
+                },
             }),
             topology: self.config.topology.clone(),
             silent,
@@ -1133,7 +1181,9 @@ impl AnyMoePipelineMixin for NormalPipeline {
             ));
 
             let mut filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
+            for rfilename in
+                api_dir_list!(api, model_id, true).filter(|x| x.ends_with(".safetensors"))
+            {
                 filenames.push(api_get_file!(api, &rfilename, model_id));
             }
 
@@ -1189,7 +1239,9 @@ impl AnyMoePipelineMixin for NormalPipeline {
             ));
 
             let mut gate_filenames = vec![];
-            for rfilename in api_dir_list!(api, model_id).filter(|x| x.ends_with(".safetensors")) {
+            for rfilename in
+                api_dir_list!(api, model_id, true).filter(|x| x.ends_with(".safetensors"))
+            {
                 gate_filenames.push(api_get_file!(api, &rfilename, model_id));
             }
             assert_eq!(

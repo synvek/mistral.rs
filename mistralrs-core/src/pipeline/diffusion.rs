@@ -8,7 +8,7 @@ use super::{
 use crate::device_map::DeviceMapper;
 use crate::diffusion_models::processor::{DiffusionProcessor, ModelInputs};
 use crate::paged_attention::AttentionImplementation;
-use crate::pipeline::ChatTemplate;
+use crate::pipeline::{ChatTemplate, Modalities, SupportedModality};
 use crate::prefix_cacher::PrefixCacheManagerV2;
 use crate::sequence::Sequence;
 use crate::utils::varbuilder_utils::DeviceForLoadTensor;
@@ -204,6 +204,7 @@ impl Loader for DiffusionLoader {
                         loading_isq: false,
                         real_device: device.clone(),
                         multi_progress: Arc::new(MultiProgress::new()),
+                        matformer_slicing_config: None,
                     },
                     attention_mechanism,
                     silent,
@@ -229,8 +230,11 @@ impl Loader for DiffusionLoader {
                 sliding_window: None,
                 cache_config: None,
                 cache_engine: None,
-                prompt_chunksize: None,
                 model_metadata: None,
+                modalities: Modalities {
+                    input: vec![SupportedModality::Text],
+                    output: vec![SupportedModality::Vision],
+                },
             }),
             dummy_cache: EitherCache::Full(Cache::new(0, false)),
         })))

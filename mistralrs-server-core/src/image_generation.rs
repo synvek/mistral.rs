@@ -1,66 +1,67 @@
-use anyhow::Result;
-use std::{error::Error, sync::Arc};
-use tokio::sync::mpsc::{channel, Sender};
+//! ## Image generation functionality and route handler.
 
-use crate::{openai::ImageGenerationRequest, types::ExtractedMistralRsState};
+use std::{error::Error, sync::Arc};
+
+use anyhow::Result;
 use axum::{
     extract::{Json, State},
-    http::{self, StatusCode},
+    http::{self},
     response::IntoResponse,
 };
 use mistralrs_core::{
     Constraint, DiffusionGenerationParams, ImageGenerationResponse, MistralRs, NormalRequest,
     Request, RequestMessage, Response, SamplingParams,
 };
-use serde::Serialize;
+use tokio::sync::mpsc::{Receiver, Sender};
 
+use crate::{
+    handler_core::{
+        base_process_non_streaming_response, create_response_channel, send_request,
+        ErrorToResponse, JsonError,
+    },
+    openai::ImageGenerationRequest,
+    types::{ExtractedMistralRsState, SharedMistralRsState},
+    util::{sanitize_error_message, validate_model_name},
+};
+
+/// Represents different types of image generation responses.
 pub enum ImageGenerationResponder {
     Json(ImageGenerationResponse),
     InternalError(Box<dyn Error>),
     ValidationError(Box<dyn Error>),
 }
 
-trait ErrorToResponse: Serialize {
-    fn to_response(&self, code: StatusCode) -> axum::response::Response {
-        let mut r = Json(self).into_response();
-        *r.status_mut() = code;
-        r
-    }
-}
-
-#[derive(Serialize)]
-struct JsonError {
-    message: String,
-}
-
-impl JsonError {
-    fn new(message: String) -> Self {
-        Self { message }
-    }
-}
-impl ErrorToResponse for JsonError {}
-
 impl IntoResponse for ImageGenerationResponder {
+    /// Converts the image generation responder into an HTTP response.
     fn into_response(self) -> axum::response::Response {
         match self {
             ImageGenerationResponder::Json(s) => Json(s).into_response(),
             ImageGenerationResponder::InternalError(e) => {
-                JsonError::new(e.to_string()).to_response(http::StatusCode::INTERNAL_SERVER_ERROR)
+                JsonError::new(sanitize_error_message(e.as_ref()))
+                    .to_response(http::StatusCode::INTERNAL_SERVER_ERROR)
             }
             ImageGenerationResponder::ValidationError(e) => {
-                JsonError::new(e.to_string()).to_response(http::StatusCode::UNPROCESSABLE_ENTITY)
+                JsonError::new(sanitize_error_message(e.as_ref()))
+                    .to_response(http::StatusCode::UNPROCESSABLE_ENTITY)
             }
         }
     }
 }
 
-fn parse_request(
+/// Parses and validates a image generation request.
+///
+/// This function transforms a image generation request into the
+/// request format used by mistral.rs.
+pub fn parse_request(
     oairequest: ImageGenerationRequest,
     state: Arc<MistralRs>,
     tx: Sender<Response>,
 ) -> Result<Request> {
     let repr = serde_json::to_string(&oairequest).expect("Serialization of request failed.");
     MistralRs::maybe_log_request(state.clone(), repr);
+
+    // Validate that the requested model matches the loaded model
+    validate_model_name(&oairequest.model, state.clone())?;
 
     Ok(Request::Normal(Box::new(NormalRequest {
         id: state.next_request_id(),
@@ -83,9 +84,15 @@ fn parse_request(
         logits_processors: None,
         return_raw_logits: false,
         web_search_options: None,
+        model_id: if oairequest.model == "default" {
+            None
+        } else {
+            Some(oairequest.model.clone())
+        },
     })))
 }
 
+/// Image generation endpoint handler.
 #[utoipa::path(
     post,
     tag = "Mistral.rs",
@@ -93,38 +100,48 @@ fn parse_request(
     request_body = ImageGenerationRequest,
     responses((status = 200, description = "Image generation"))
 )]
-
 pub async fn image_generation(
     State(state): ExtractedMistralRsState,
     Json(oairequest): Json<ImageGenerationRequest>,
 ) -> ImageGenerationResponder {
-    let (tx, mut rx) = channel(10_000);
+    let (tx, mut rx) = create_response_channel(None);
 
     let request = match parse_request(oairequest, state.clone(), tx) {
         Ok(x) => x,
-        Err(e) => {
-            let e = anyhow::Error::msg(e.to_string());
-            MistralRs::maybe_log_error(state, &*e);
-            return ImageGenerationResponder::InternalError(e.into());
-        }
+        Err(e) => return handle_error(state, e.into()),
     };
-    let sender = state.get_sender().unwrap();
 
-    if let Err(e) = sender.send(request).await {
-        let e = anyhow::Error::msg(e.to_string());
-        MistralRs::maybe_log_error(state, &*e);
-        return ImageGenerationResponder::InternalError(e.into());
+    if let Err(e) = send_request(&state, request).await {
+        return handle_error(state, e.into());
     }
 
-    let response = match rx.recv().await {
-        Some(response) => response,
-        None => {
-            let e = anyhow::Error::msg("No response received from the model.");
-            MistralRs::maybe_log_error(state, &*e);
-            return ImageGenerationResponder::InternalError(e.into());
-        }
-    };
+    process_non_streaming_response(&mut rx, state).await
+}
 
+/// Helper function to handle image generation errors and logging them.
+pub fn handle_error(
+    state: SharedMistralRsState,
+    e: Box<dyn std::error::Error + Send + Sync + 'static>,
+) -> ImageGenerationResponder {
+    let sanitized_msg = sanitize_error_message(&*e);
+    let e = anyhow::Error::msg(sanitized_msg);
+    MistralRs::maybe_log_error(state, &*e);
+    ImageGenerationResponder::InternalError(e.into())
+}
+
+/// Process non-streaming image generation responses.
+pub async fn process_non_streaming_response(
+    rx: &mut Receiver<Response>,
+    state: SharedMistralRsState,
+) -> ImageGenerationResponder {
+    base_process_non_streaming_response(rx, state, match_responses, handle_error).await
+}
+
+/// Matches and processes different types of model responses into appropriate image generation responses.
+pub fn match_responses(
+    state: SharedMistralRsState,
+    response: Response,
+) -> ImageGenerationResponder {
     match response {
         Response::InternalError(e) => {
             MistralRs::maybe_log_error(state, &*e);

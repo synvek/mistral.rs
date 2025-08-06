@@ -19,7 +19,9 @@ use crate::pipeline::{extract_logits, EitherCache, KvCache, NormalCache};
 use crate::utils::gguf_metadata::ContentMetadata;
 use crate::utils::model_config as ModelConfig;
 use crate::utils::progress::NiceProgressBar;
-const MAX_SEQ_LEN: u32 = 4096;
+
+// Default fallback for models that don't specify context_length
+const DEFAULT_MAX_SEQ_LEN: u32 = 4096;
 
 struct Mlp {
     feed_forward_w1: Arc<dyn QuantMethod>,
@@ -42,6 +44,8 @@ struct LayerWeights {
     attention_wv: Arc<dyn QuantMethod>,
     attention_wo: Arc<dyn QuantMethod>,
     attention_norm: QRmsNorm,
+    q_norm: QRmsNorm,
+    k_norm: QRmsNorm,
     mlp: Mlp,
     ffn_norm: QRmsNorm,
     n_head: usize,
@@ -64,15 +68,9 @@ impl LayerWeights {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
 
-        let q = MatMul
-            .qmethod_matmul(x, &*self.attention_wq)?
-            .to_dtype(self.dtype)?;
-        let k = MatMul
-            .qmethod_matmul(x, &*self.attention_wk)?
-            .to_dtype(self.dtype)?;
-        let v = MatMul
-            .qmethod_matmul(x, &*self.attention_wv)?
-            .to_dtype(self.dtype)?;
+        let q = MatMul.qmethod_matmul(x, &*self.attention_wq)?;
+        let k = MatMul.qmethod_matmul(x, &*self.attention_wk)?;
+        let v = MatMul.qmethod_matmul(x, &*self.attention_wv)?;
 
         let (q, k, v) = if seq_len != 1 {
             let q = q
@@ -92,7 +90,21 @@ impl LayerWeights {
             (q, k, v)
         };
 
+        // Per-head RMSNorm in Qwen3
+        let q_flat = q.flatten(0, 2)?;
+        let k_flat = k.flatten(0, 2)?;
+        let q_flat = self.q_norm.forward(&q_flat)?;
+        let k_flat = self.k_norm.forward(&k_flat)?;
+        let q = q_flat.reshape((b_sz, self.n_head, seq_len, self.head_dim))?;
+        let k = k_flat.reshape((b_sz, self.n_kv_head, seq_len, self.head_dim))?;
+
         let (q, k) = self.rotary.forward(&q, &k, start_offsets)?;
+
+        let (q, k, v) = (
+            q.to_dtype(self.dtype)?,
+            k.to_dtype(self.dtype)?,
+            v.to_dtype(self.dtype)?,
+        );
 
         let y = match &self.paged_attn {
             Some(paged_attn) => {
@@ -139,7 +151,7 @@ pub struct ModelWeights {
     dtype: DType,
 }
 
-// qwen2 `llm` fields:
+// qwen3 `llm` fields:
 // https://github.com/ggerganov/ggml/blob/master/docs/gguf.md#llm
 // NOTE: Types here do not match spec
 pub(crate) struct PropsGGUF {
@@ -154,11 +166,26 @@ pub(crate) struct PropsGGUF {
     pub value_length: usize,
 }
 
+fn verify_qwen3_arch(
+    metadata: &HashMap<String, candle_core::quantized::gguf_file::Value>,
+) -> Result<String> {
+    use crate::utils::gguf_metadata::TryValueInto;
+    let actual_arch: String = metadata
+        .get("general.architecture")
+        .cloned()
+        .try_value_into()?;
+
+    if actual_arch != "qwen3" {
+        candle_core::bail!("Expected `qwen3` architecture, got `{actual_arch}`.");
+    }
+    Ok(actual_arch)
+}
+
 impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
     type Error = anyhow::Error;
 
     fn try_from(c: ContentMetadata) -> std::result::Result<Self, Self::Error> {
-        c.verify_arch("qwen2")?;
+        let _ = verify_qwen3_arch(c.metadata)?;
 
         let required = [
             "attention.head_count",
@@ -179,12 +206,11 @@ impl TryFrom<ContentMetadata<'_>> for PropsGGUF {
             head_count_kv: c.get_value::<u32>("attention.head_count_kv")? as usize,
             block_count: c.get_value::<u32>("block_count")? as usize,
             embedding_length: embed_len,
-            // Strangely this value is generally 1e-6 in GGUF file but used to be 1e-5 by default.
             rms_norm_eps: c.get_value("attention.layer_norm_rms_epsilon")?,
             max_seq_len: c
                 .get_value::<u64>("context_length")
                 .ok()
-                .unwrap_or(MAX_SEQ_LEN as u64) as usize,
+                .unwrap_or(DEFAULT_MAX_SEQ_LEN as u64) as usize,
             rope_freq_base: c.get_value("rope.freq_base").ok().unwrap_or(10_000_f32),
             key_length: c
                 .get_value::<u32>("attention.key_length")
@@ -211,9 +237,12 @@ impl ModelConfig::FromGGUF for ModelWeights {
         dtype: DType,
     ) -> Result<Self> {
         // Parameter extraction from metadata.
+        let meta = ct.get_metadata();
+        let actual_arch = verify_qwen3_arch(meta)?;
+
         let metadata = ContentMetadata {
-            path_prefix: "qwen2",
-            metadata: ct.get_metadata(),
+            path_prefix: &actual_arch,
+            metadata: meta,
         };
         let PropsGGUF {
             head_count,
@@ -255,7 +284,7 @@ impl ModelConfig::FromGGUF for ModelWeights {
                     max_seq_len,
                     device,
                     true,
-                    dtype,
+                    DType::F32,
                 )?),
             );
         }
@@ -273,17 +302,8 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 .clone();
 
             let attention_wq = ct.tensor(&format!("{prefix}.attn_q.weight"), device)?;
-            let attention_bias_q = ct
-                .tensor(&format!("{prefix}.attn_q.bias"), device)?
-                .dequantize(device)?;
             let attention_wk = ct.tensor(&format!("{prefix}.attn_k.weight"), device)?;
-            let attention_bias_k = ct
-                .tensor(&format!("{prefix}.attn_k.bias"), device)?
-                .dequantize(device)?;
             let attention_wv = ct.tensor(&format!("{prefix}.attn_v.weight"), device)?;
-            let attention_bias_v = ct
-                .tensor(&format!("{prefix}.attn_v.bias"), device)?
-                .dequantize(device)?;
             let attention_wo = ct.tensor(&format!("{prefix}.attn_output.weight"), device)?;
 
             let feed_forward_w1 = ct.tensor(&format!("{prefix}.ffn_gate.weight"), device)?;
@@ -304,6 +324,16 @@ impl ModelConfig::FromGGUF for ModelWeights {
                 })?),
             };
 
+            // Qwen3 always has q_norm and k_norm
+            let q_norm = QRmsNorm::new(
+                ct.tensor(&format!("{prefix}.attn_q_norm.weight"), device)?,
+                rms_norm_eps,
+            )?;
+            let k_norm = QRmsNorm::new(
+                ct.tensor(&format!("{prefix}.attn_k_norm.weight"), device)?,
+                rms_norm_eps,
+            )?;
+
             let attention_norm = ct.tensor(&format!("{prefix}.attn_norm.weight"), device)?;
             let ffn_norm = ct.tensor(&format!("{prefix}.ffn_norm.weight"), device)?;
             let paged_attn = match &attention_mechanism {
@@ -315,21 +345,23 @@ impl ModelConfig::FromGGUF for ModelWeights {
             layers.push(LayerWeights {
                 attention_wq: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                     q_weight: Arc::new(attention_wq),
-                    b: Some(attention_bias_q),
+                    b: None,
                 })?),
                 attention_wk: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                     q_weight: Arc::new(attention_wk),
-                    b: Some(attention_bias_k),
+                    b: None,
                 })?),
                 attention_wv: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                     q_weight: Arc::new(attention_wv),
-                    b: Some(attention_bias_v),
+                    b: None,
                 })?),
                 attention_wo: Arc::new(GgufMatMul::new(QuantMethodConfig::Gguf {
                     q_weight: Arc::new(attention_wo),
                     b: None,
                 })?),
                 attention_norm: QRmsNorm::new(attention_norm, rms_norm_eps)?,
+                q_norm,
+                k_norm,
                 mlp,
                 ffn_norm: QRmsNorm::new(ffn_norm, rms_norm_eps)?,
                 n_head: head_count,

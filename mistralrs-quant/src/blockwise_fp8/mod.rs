@@ -4,6 +4,7 @@ use candle_core::{quantized::GgmlDType, DType, Device, Result, Tensor};
 use candle_nn::Linear;
 
 mod ops;
+pub use ops::{fp8_blockwise_dequantize, fp8_blockwise_quantize};
 
 #[cfg(feature = "cuda")]
 mod ffi;
@@ -38,7 +39,8 @@ impl QuantMethod for BlockwiseFP8Linear {
             | QuantMethodConfig::Unquantized(_)
             | QuantMethodConfig::Bnb { .. }
             | QuantMethodConfig::FP8 { .. }
-            | QuantMethodConfig::Afq { .. } => unreachable!(),
+            | QuantMethodConfig::Afq { .. }
+            | QuantMethodConfig::MXFP4 { .. } => unreachable!(),
             QuantMethodConfig::BlockwiseFP8 {
                 weight,
                 weight_scale_inv,

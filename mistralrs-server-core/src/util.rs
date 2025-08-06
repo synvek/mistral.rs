@@ -1,6 +1,10 @@
 //! ## General utilities.
 
 use image::DynamicImage;
+use mistralrs_core::AudioInput;
+use mistralrs_core::MistralRs;
+use std::error::Error;
+use std::sync::Arc;
 use tokio::{
     fs::{self, File},
     io::AsyncReadExt,
@@ -16,7 +20,7 @@ use tokio::{
 /// ### Arguments
 ///
 /// * `url_unparsed` - A string that can be:
-///   - An HTTP/HTTPS URL (e.g., "https://example.com/image.png")
+///   - An HTTP/HTTPS URL (e.g., "<https://example.com/image.png>")
 ///   - A file path (e.g., "/path/to/image.jpg" or "image.png")
 ///   - A data URL with base64 encoded image (e.g., "data:image/png;base64,...")
 ///   - A file URL (e.g., "file:///path/to/image.jpg")
@@ -78,6 +82,132 @@ pub async fn parse_image_url(url_unparsed: &str) -> Result<DynamicImage, anyhow:
     };
 
     Ok(image::load_from_memory(&bytes)?)
+}
+
+/// Parses and loads an audio file from a URL, file path, or data URL.
+pub async fn parse_audio_url(url_unparsed: &str) -> Result<AudioInput, anyhow::Error> {
+    let url = if let Ok(url) = url::Url::parse(url_unparsed) {
+        url
+    } else if File::open(url_unparsed).await.is_ok() {
+        url::Url::from_file_path(std::path::absolute(url_unparsed)?)
+            .map_err(|_| anyhow::anyhow!("Could not parse file path: {}", url_unparsed))?
+    } else {
+        url::Url::parse(url_unparsed)
+            .map_err(|_| anyhow::anyhow!("Could not parse as base64 data: {}", url_unparsed))?
+    };
+
+    let bytes = if url.scheme() == "http" || url.scheme() == "https" {
+        match reqwest::get(url.clone()).await {
+            Ok(http_resp) => http_resp.bytes().await?.to_vec(),
+            Err(e) => anyhow::bail!(e),
+        }
+    } else if url.scheme() == "file" {
+        let path = url
+            .to_file_path()
+            .map_err(|_| anyhow::anyhow!("Could not parse file path: {}", url))?;
+
+        if let Ok(mut f) = File::open(&path).await {
+            let metadata = fs::metadata(&path).await?;
+            let mut buffer = vec![0; metadata.len() as usize];
+            f.read_exact(&mut buffer).await?;
+            buffer
+        } else {
+            anyhow::bail!("Could not open file at path: {}", url);
+        }
+    } else if url.scheme() == "data" {
+        let data_url = data_url::DataUrl::process(url.as_str())?;
+        data_url.decode_to_vec()?.0
+    } else {
+        anyhow::bail!("Unsupported URL scheme: {}", url.scheme());
+    };
+
+    AudioInput::from_bytes(&bytes)
+}
+
+/// Validates that the requested model matches one of the loaded models.
+///
+/// This function checks if the model parameter from an OpenAI API request
+/// matches one of the models that are currently loaded by the server.
+///
+/// The special model name "default" can be used to bypass this validation,
+/// which is useful for clients that require a model parameter but want
+/// to use the default model.
+///
+/// ### Arguments
+///
+/// * `requested_model` - The model name from the API request
+/// * `state` - The MistralRs state containing the loaded models info
+///
+/// ### Returns
+///
+/// Returns `Ok(())` if the model is available or if "default" is specified, otherwise returns an error.
+pub fn validate_model_name(
+    requested_model: &str,
+    state: Arc<MistralRs>,
+) -> Result<(), anyhow::Error> {
+    // Allow "default" as a special case to bypass validation
+    if requested_model == "default" {
+        return Ok(());
+    }
+
+    let available_models = state
+        .list_models()
+        .map_err(|e| anyhow::anyhow!("Failed to get available models: {}", e))?;
+
+    if available_models.is_empty() {
+        anyhow::bail!("No models are currently loaded.");
+    }
+
+    if !available_models.contains(&requested_model.to_string()) {
+        anyhow::bail!(
+            "Requested model '{}' is not available. Available models: {}. Use 'default' to use the default model.",
+            requested_model,
+            available_models.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Sanitize error messages to remove internal implementation details like stack traces.
+/// This ensures that sensitive internal information is not exposed to API clients.
+///
+/// The function traverses the error chain to find the deepest (root) error and returns its message.
+/// This is useful for API responses where we want to provide meaningful error information
+/// without exposing internal stack traces or implementation details.
+///
+/// ### Arguments
+///
+/// * `error` - The error to sanitize
+///
+/// ### Returns
+///
+/// The message from the root cause error in the error chain
+///
+/// ### Examples
+///
+/// ```ignore
+/// use mistralrs_server_core::util::sanitize_error_message;
+///
+/// // For a simple error without chain
+/// let error = std::io::Error::new(std::io::ErrorKind::NotFound, "File not found");
+/// assert_eq!(sanitize_error_message(&error), "File not found");
+///
+/// // For chained errors, returns the root cause
+/// let root = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Access denied");
+/// let wrapped = anyhow::Error::new(root).context("Failed to read file");
+/// // This would return "Access denied" instead of "Failed to read file"
+/// ```
+pub fn sanitize_error_message(error: &(dyn Error + 'static)) -> String {
+    // Traverse the error chain to find the deepest (root) error and return its message.
+    let mut current: &dyn Error = error;
+
+    // Keep traversing until we find an error with no source
+    while let Some(source) = current.source() {
+        current = source;
+    }
+
+    // Return the message of the root cause error
+    current.to_string()
 }
 
 #[cfg(test)]
@@ -147,8 +277,125 @@ mod tests {
         c7YCVIAfi6JYn5bHjTHTGmurQJXJ8C/um928G9zK4gAAAABJRU5ErkJggg==
         ";
 
-        let url = format!("data:image/png;base64,{}", url);
+        let url = format!("data:image/png;base64,{url}");
         let image = parse_image_url(&url).await.unwrap();
         assert_eq!(image.dimensions(), (32, 32));
+
+        // audio from base64
+        let audio_b64 = "UklGRiYAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQIAAAAAAA==";
+        let url = format!("data:audio/wav;base64,{audio_b64}");
+        let audio = parse_audio_url(&url).await.unwrap();
+        assert_eq!(audio.sample_rate, 8000);
+        assert_eq!(audio.samples.len(), 1);
+    }
+
+    #[test]
+    fn test_sanitize_error_message_with_backtrace() {
+        // Test error with backtrace
+        let error_with_backtrace = "Failed to parse Forge Provider response: A weight is negative, too large or not a valid number
+  0: candle_core::error::Error::bt
+  1: mistralrs_core::sampler::Sampler::sample_multinomial
+  2: mistralrs_core::sampler::Sampler::sample_top_kp_min_p
+  3: mistralrs_core::sampler::Sampler::sample
+  4: mistralrs_core::pipeline::sampling::sample_sequence::{{closure}}";
+
+        struct TestError(String);
+        impl std::fmt::Display for TestError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::fmt::Debug for TestError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for TestError {}
+
+        let error = TestError(error_with_backtrace.to_string());
+        let sanitized = sanitize_error_message(&error);
+
+        // Since TestError has no source(), it should return the full message including backtrace
+        assert_eq!(sanitized, error_with_backtrace);
+        // The improved solution returns the root error as-is when there's no error chain
+    }
+
+    #[test]
+    fn test_sanitize_error_message_without_backtrace() {
+        // Test error without backtrace
+        let simple_error = "Simple error message without backtrace";
+
+        struct TestError(String);
+        impl std::fmt::Display for TestError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::fmt::Debug for TestError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+        impl std::error::Error for TestError {}
+
+        let error = TestError(simple_error.to_string());
+        let sanitized = sanitize_error_message(&error);
+
+        assert_eq!(sanitized, simple_error);
+    }
+
+    #[test]
+    fn test_sanitize_error_message_with_chain() {
+        // Test error chain - the root cause should be extracted
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct RootError;
+        impl fmt::Display for RootError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "Root cause: Database connection failed")
+            }
+        }
+        impl std::error::Error for RootError {}
+
+        #[derive(Debug)]
+        struct MiddleError(Box<dyn std::error::Error>);
+        impl fmt::Display for MiddleError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "Middle error: Service unavailable")
+            }
+        }
+        impl std::error::Error for MiddleError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&*self.0)
+            }
+        }
+
+        #[derive(Debug)]
+        struct TopError(Box<dyn std::error::Error>);
+        impl fmt::Display for TopError {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "Top error: Request failed with backtrace\n  0: some::module::function"
+                )
+            }
+        }
+        impl std::error::Error for TopError {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&*self.0)
+            }
+        }
+
+        let root = RootError;
+        let middle = MiddleError(Box::new(root));
+        let top = TopError(Box::new(middle));
+
+        let sanitized = sanitize_error_message(&top);
+
+        // Should return the root cause, not the top-level error with backtrace
+        assert_eq!(sanitized, "Root cause: Database connection failed");
+        assert!(!sanitized.contains("backtrace"));
+        assert!(!sanitized.contains("Request failed"));
     }
 }

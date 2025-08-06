@@ -40,7 +40,6 @@ impl TextSpeculativeBuilder {
 
     fn build_pipeline(builder: TextModelBuilder) -> anyhow::Result<Arc<Mutex<dyn Pipeline>>> {
         let config = NormalSpecificConfig {
-            prompt_chunksize: builder.prompt_chunksize,
             topology: builder.topology,
             organization: builder.organization,
             write_uqff: builder.write_uqff,
@@ -48,6 +47,8 @@ impl TextSpeculativeBuilder {
             imatrix: builder.imatrix,
             calibration_file: builder.calibration_file,
             hf_cache_path: builder.hf_cache_path,
+            matformer_config_path: None,
+            matformer_slice_name: None,
         };
 
         if builder.with_logging {
@@ -103,7 +104,10 @@ impl TextSpeculativeBuilder {
         if let Some(cb) = self.target.search_callback.clone() {
             runner = runner.with_search_callback(cb);
         }
+        for (name, cb) in &self.target.tool_callbacks {
+            runner = runner.with_tool_callback(name.clone(), cb.clone());
+        }
 
-        Ok(Model::new(runner.build()))
+        Ok(Model::new(runner.build().await))
     }
 }

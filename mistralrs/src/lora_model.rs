@@ -24,7 +24,6 @@ impl LoraModelBuilder {
 
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = NormalSpecificConfig {
-            prompt_chunksize: self.text_model.prompt_chunksize,
             topology: self.text_model.topology,
             organization: self.text_model.organization,
             write_uqff: self.text_model.write_uqff,
@@ -32,6 +31,8 @@ impl LoraModelBuilder {
             imatrix: None,
             calibration_file: None,
             hf_cache_path: self.text_model.hf_cache_path,
+            matformer_config_path: None,
+            matformer_slice_name: None,
         };
 
         if self.text_model.with_logging {
@@ -93,6 +94,9 @@ impl LoraModelBuilder {
         if let Some(cb) = self.text_model.search_callback.clone() {
             runner = runner.with_search_callback(cb);
         }
+        for (name, cb) in &self.text_model.tool_callbacks {
+            runner = runner.with_tool_callback(name.clone(), cb.clone());
+        }
         runner = runner
             .with_no_kv_cache(self.text_model.no_kv_cache)
             .with_no_prefix_cache(self.text_model.prefix_cache_n.is_none());
@@ -101,6 +105,6 @@ impl LoraModelBuilder {
             runner = runner.with_prefix_cache_n(n)
         }
 
-        Ok(Model::new(runner.build()))
+        Ok(Model::new(runner.build().await))
     }
 }

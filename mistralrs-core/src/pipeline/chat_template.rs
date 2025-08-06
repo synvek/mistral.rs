@@ -5,6 +5,7 @@ use either::Either;
 use indexmap::IndexMap;
 use itertools::Itertools;
 use minijinja::{context, value::Kwargs, Environment, Error, ErrorKind, Value};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 use tracing::info;
@@ -113,29 +114,33 @@ pub fn calculate_eos_tokens(
     }
 
     if let Some(gen_conf) = gen_conf {
-        let ids = match gen_conf.eos_token_id {
-            Either::Left(id) => vec![id],
-            Either::Right(ids) => ids,
-        };
-        for id in ids {
-            let s = tokenizer
-                .decode(&[id], false)
-                .unwrap_or_else(|_| panic!("Unable to decode id {id})"));
-            if !eos_tok_ids.contains(&s) {
-                eos_tok_ids.push(s);
+        if let Some(eos_field) = gen_conf.eos_token_id {
+            let ids = match eos_field {
+                Either::Left(id) => vec![id],
+                Either::Right(ids) => ids,
+            };
+            for id in ids {
+                let s = tokenizer
+                    .decode(&[id], false)
+                    .unwrap_or_else(|_| panic!("Unable to decode id {id})"));
+                if !eos_tok_ids.contains(&s) {
+                    eos_tok_ids.push(s);
+                }
             }
         }
 
-        let ids = match gen_conf.bos_token_id {
-            Either::Left(id) => vec![id],
-            Either::Right(ids) => ids,
-        };
-        for id in ids {
-            let s = tokenizer
-                .decode(&[id], false)
-                .unwrap_or_else(|_| panic!("Unable to decode id {id})"));
-            if !bos_tok_ids.contains(&s) {
-                bos_tok_ids.push(s);
+        if let Some(bos_field) = gen_conf.bos_token_id {
+            let ids = match bos_field {
+                Either::Left(id) => vec![id],
+                Either::Right(ids) => ids,
+            };
+            for id in ids {
+                let s = tokenizer
+                    .decode(&[id], false)
+                    .unwrap_or_else(|_| panic!("Unable to decode id {id})"));
+                if !bos_tok_ids.contains(&s) {
+                    bos_tok_ids.push(s);
+                }
             }
         }
     }
@@ -145,12 +150,12 @@ pub fn calculate_eos_tokens(
 
     let bos_render = bos_tok_ids
         .iter()
-        .map(|val| format!("{:?}", val))
+        .map(|val| format!("{val:?}"))
         .collect::<Vec<String>>()
         .join(", ");
     let eos_render = eos_tok_ids
         .iter()
-        .map(|val| format!("{:?}", val))
+        .map(|val| format!("{val:?}"))
         .collect::<Vec<String>>()
         .join(", ");
 
@@ -175,10 +180,10 @@ pub fn calculate_eos_tokens(
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct GenerationConfig {
-    #[serde(with = "either::serde_untagged")]
-    bos_token_id: Either<u32, Vec<u32>>,
-    #[serde(with = "either::serde_untagged")]
-    eos_token_id: Either<u32, Vec<u32>>,
+    #[serde(with = "either::serde_untagged_optional")]
+    bos_token_id: Option<Either<u32, Vec<u32>>>,
+    #[serde(with = "either::serde_untagged_optional")]
+    eos_token_id: Option<Either<u32, Vec<u32>>>,
 }
 
 fn tojson(value: Value, kwargs: Kwargs) -> Result<Value, Error> {
@@ -292,7 +297,27 @@ pub fn apply_chat_template_to(
             template
         }
     };
-    let template = template.replace("[::-1]", "|reverse");
+    let mut template = template.replace("[::-1]", "|reverse");
+    // Convert Python‑style descending ranges `range(..., -1, -1)` to a forward
+    // range followed by Jinja’s `|reverse` filter so it works even when
+    // negative‑step ranges aren’t supported.
+    let re = Regex::new(r"range\((?P<expr>[^,]+),\s*-1,\s*-1\)").unwrap();
+    template = re
+        .replace_all(&template, |caps: &regex::Captures| {
+            format!("range({})|reverse", &caps["expr"])
+        })
+        .into_owned();
+
+    if template.contains("{{ meta }}") {
+        // Fix for GLM4 models
+        template = template.replace("{%- set meta = message.get(\"metadata\", \"\") %}", "");
+        template = template.replace("{{ meta }}", "");
+    }
+    if template.contains("{% generation %}") && template.contains("{% endgeneration %}") {
+        // Strip for smollm3 models
+        template = template.replace("{% generation %}", "");
+        template = template.replace("{% endgeneration %}", "");
+    }
 
     env.add_template("chat_template", &template)?;
     env.add_function("raise_exception", raise_exception);
@@ -311,7 +336,7 @@ pub fn apply_chat_template_to(
             eos_token => eos_tok,
             unk_token => unk_tok,
             date_string => date_string,
-            enable_thinking => enable_thinking,
+            enable_thinking => enable_thinking.unwrap_or(true),
         })?)
     } else {
         Ok(tmpl.render(context! {
@@ -320,9 +345,10 @@ pub fn apply_chat_template_to(
             bos_token => bos_tok,
             eos_token => eos_tok,
             unk_token => unk_tok,
+            xml_tools => tools.clone(), // SmolLM3
             tools => tools,
             date_string => date_string,
-            enable_thinking => enable_thinking,
+            enable_thinking => enable_thinking.unwrap_or(true),
         })?)
     }
 }

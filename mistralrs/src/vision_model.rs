@@ -1,14 +1,21 @@
 use candle_core::Device;
-use mistralrs_core::SearchCallback;
 use mistralrs_core::*;
+use mistralrs_core::{SearchCallback, Tool, ToolCallback};
+use std::collections::HashMap;
 use std::{
-    num::NonZeroUsize,
     ops::{Deref, DerefMut},
     path::PathBuf,
     sync::Arc,
 };
 
 use crate::{best_device, Model};
+
+/// A tool callback with its associated Tool definition.
+#[derive(Clone)]
+pub struct ToolCallbackWithTool {
+    pub callback: Arc<ToolCallback>,
+    pub tool: Tool,
+}
 
 #[derive(Clone)]
 /// Configure a vision model with the various parameters for loading, running, and other inference behaviors.
@@ -29,10 +36,13 @@ pub struct VisionModelBuilder {
     pub(crate) hf_cache_path: Option<PathBuf>,
     pub(crate) search_bert_model: Option<BertEmbeddingModel>,
     pub(crate) search_callback: Option<Arc<SearchCallback>>,
+    pub(crate) tool_callbacks: HashMap<String, Arc<ToolCallback>>,
+    pub(crate) tool_callbacks_with_tools: HashMap<String, ToolCallbackWithTool>,
     pub(crate) device: Option<Device>,
+    pub(crate) matformer_config_path: Option<PathBuf>,
+    pub(crate) matformer_slice_name: Option<String>,
 
     // Model running
-    pub(crate) prompt_chunksize: Option<NonZeroUsize>,
     pub(crate) topology: Option<Topology>,
     pub(crate) loader_type: Option<VisionLoaderType>,
     pub(crate) dtype: ModelDType,
@@ -58,7 +68,6 @@ impl VisionModelBuilder {
             topology: None,
             write_uqff: None,
             from_uqff: None,
-            prompt_chunksize: None,
             chat_template: None,
             tokenizer_json: None,
             max_edge: None,
@@ -79,7 +88,11 @@ impl VisionModelBuilder {
             hf_cache_path: None,
             search_bert_model: None,
             search_callback: None,
+            tool_callbacks: HashMap::new(),
+            tool_callbacks_with_tools: HashMap::new(),
             device: None,
+            matformer_config_path: None,
+            matformer_slice_name: None,
         }
     }
 
@@ -95,6 +108,29 @@ impl VisionModelBuilder {
         self
     }
 
+    pub fn with_tool_callback(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+    ) -> Self {
+        self.tool_callbacks.insert(name.into(), callback);
+        self
+    }
+
+    /// Register a callback with an associated Tool definition that will be automatically
+    /// added to requests when tool callbacks are active.
+    pub fn with_tool_callback_and_tool(
+        mut self,
+        name: impl Into<String>,
+        callback: Arc<ToolCallback>,
+        tool: Tool,
+    ) -> Self {
+        let name = name.into();
+        self.tool_callbacks_with_tools
+            .insert(name, ToolCallbackWithTool { callback, tool });
+        self
+    }
+
     /// Enable runner throughput logging.
     pub fn with_throughput_logging(mut self) -> Self {
         self.throughput_logging = true;
@@ -104,12 +140,6 @@ impl VisionModelBuilder {
     /// Explicit JINJA chat template file (.jinja) to be used. If specified, this overrides all other chat templates.
     pub fn with_jinja_explicit(mut self, jinja_explicit: String) -> Self {
         self.jinja_explicit = Some(jinja_explicit);
-        self
-    }
-
-    /// Set the prompt batchsize to use for inference.
-    pub fn with_prompt_chunksize(mut self, prompt_chunksize: NonZeroUsize) -> Self {
-        self.prompt_chunksize = Some(prompt_chunksize);
         self
     }
 
@@ -175,7 +205,7 @@ impl VisionModelBuilder {
     }
 
     /// Enable PagedAttention. Configure PagedAttention with a [`PagedAttentionConfig`] object, which
-    /// can be created with sensible values with a [`PagedAttentionMetaBuilder`].
+    /// can be created with sensible values with a [`PagedAttentionMetaBuilder`](crate::PagedAttentionMetaBuilder).
     ///
     /// If PagedAttention is not supported (query with [`paged_attn_supported`]), this will do nothing.
     pub fn with_paged_attn(
@@ -208,7 +238,16 @@ impl VisionModelBuilder {
         self
     }
 
-    /// Path to read a UQFF file from.
+    #[deprecated(
+        note = "Use `UqffTextModelBuilder` to load a UQFF model instead of the generic `from_uqff`"
+    )]
+    /// Path to read a `.uqff` file from. Other necessary configuration files must be present at this location.
+    ///
+    /// For example, these include:
+    /// - `residual.safetensors`
+    /// - `tokenizer.json`
+    /// - `config.json`
+    /// - More depending on the model
     pub fn from_uqff(mut self, path: Vec<PathBuf>) -> Self {
         self.from_uqff = Some(path);
         self
@@ -221,14 +260,16 @@ impl VisionModelBuilder {
         self
     }
 
-    /// Path to write a UQFF file to.
+    /// Path to write a `.uqff` file to and serialize the other necessary files.
     ///
     /// The parent (part of the path excluding the filename) will determine where any other files
-    /// generated are written to. These can be used to load UQFF models standalone, and may include:
+    /// serialized are written to.
+    ///
+    /// For example, these include:
     /// - `residual.safetensors`
     /// - `tokenizer.json`
     /// - `config.json`
-    /// - And others
+    /// - More depending on the model
     pub fn write_uqff(mut self, path: PathBuf) -> Self {
         self.write_uqff = Some(path);
         self
@@ -246,9 +287,20 @@ impl VisionModelBuilder {
         self
     }
 
+    /// Path to a Matryoshka Transformer configuration CSV file.
+    pub fn with_matformer_config_path(mut self, path: PathBuf) -> Self {
+        self.matformer_config_path = Some(path);
+        self
+    }
+
+    /// Name of the slice to use from the Matryoshka Transformer configuration.
+    pub fn with_matformer_slice_name(mut self, name: String) -> Self {
+        self.matformer_slice_name = Some(name);
+        self
+    }
+
     pub async fn build(self) -> anyhow::Result<Model> {
         let config = VisionSpecificConfig {
-            prompt_chunksize: self.prompt_chunksize,
             topology: self.topology,
             write_uqff: self.write_uqff,
             from_uqff: self.from_uqff,
@@ -256,6 +308,8 @@ impl VisionModelBuilder {
             calibration_file: self.calibration_file,
             imatrix: self.imatrix,
             hf_cache_path: self.hf_cache_path,
+            matformer_config_path: self.matformer_config_path,
+            matformer_slice_name: self.matformer_slice_name,
         };
 
         if self.with_logging {
@@ -319,9 +373,19 @@ impl VisionModelBuilder {
         if let Some(cb) = self.search_callback.clone() {
             runner = runner.with_search_callback(cb);
         }
+        for (name, cb) in &self.tool_callbacks {
+            runner = runner.with_tool_callback(name.clone(), cb.clone());
+        }
+        for (name, callback_with_tool) in &self.tool_callbacks_with_tools {
+            runner = runner.with_tool_callback_and_tool(
+                name.clone(),
+                callback_with_tool.callback.clone(),
+                callback_with_tool.tool.clone(),
+            );
+        }
         let runner = runner.with_no_kv_cache(false).with_no_prefix_cache(false);
 
-        Ok(Model::new(runner.build()))
+        Ok(Model::new(runner.build().await))
     }
 }
 
@@ -337,7 +401,7 @@ impl UqffVisionModelBuilder {
     /// - Automatic device mapping with model defaults according to `AutoDeviceMapParams`
     pub fn new(model_id: impl ToString, uqff_file: Vec<PathBuf>) -> Self {
         let mut inner = VisionModelBuilder::new(model_id);
-        inner = inner.from_uqff(uqff_file);
+        inner.from_uqff = Some(uqff_file);
         Self(inner)
     }
 

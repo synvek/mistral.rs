@@ -142,6 +142,21 @@ impl KvCache {
         }
     }
 
+    pub fn try_set_len(&self, len: usize) -> candle_core::Result<()> {
+        match self {
+            Self::Normal { k, v } => {
+                k.try_set_len(len)?;
+                v.try_set_len(len)?;
+                Ok(())
+            }
+            Self::Rotating { k, v } => {
+                k.try_set_len(len)?;
+                v.try_set_len(len)?;
+                Ok(())
+            }
+        }
+    }
+
     pub fn is_rotating(&self) -> bool {
         matches!(self, Self::Rotating { .. })
     }
@@ -234,7 +249,12 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 } else {
                     seqs[0].normal_cache()
                 };
-                let cache = src_cache.get(layer).unwrap().as_ref().unwrap();
+                let Some(cache) = src_cache.get(layer).unwrap().as_ref() else {
+                    // This is hit in gemma3n for the shared kv cache
+                    new_k_cache.push(None);
+                    new_v_cache.push(None);
+                    continue;
+                };
                 match cache {
                     KvCache::Normal { k, v } => {
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
@@ -258,7 +278,10 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
                 } else {
                     seq.normal_cache()
                 };
-                let cache = src_cache.get(layer).unwrap().as_ref().unwrap();
+                let Some(cache) = src_cache.get(layer).unwrap().as_ref() else {
+                    // Skip for shared kv cache layers in models like gemma3n
+                    continue;
+                };
                 let (src_k, src_v) = match cache {
                     KvCache::Normal { k, v } => {
                         (k.all_data.clone().unwrap(), v.all_data.clone().unwrap())
@@ -285,7 +308,28 @@ impl<T: CacheManagerMixin + MetadataMixin + ?Sized> CacheManager<T> for NormalCa
         for (layer_idx, (k_cache, v_cache)) in new_k_cache.into_iter().zip(new_v_cache).enumerate()
         {
             // Use this for the various parameters. Assumes all seqs are from one model.
-            match seq0_cache[layer_idx].as_ref().unwrap() {
+            let Some(cache_ref) = seq0_cache[layer_idx].as_ref() else {
+                // This is hit in gemma3n for the shared kv cache - create dummy cache
+                // These layers don't have their own cache because they share another layer's cache
+                caches.push(KvCache::Normal {
+                    k: SingleCache {
+                        all_data: None,
+                        dim: 0,
+                        current_seq_len: 0,
+                        max_seq_len: 0,
+                        capacity_seq_len: 0,
+                    },
+                    v: SingleCache {
+                        all_data: None,
+                        dim: 0,
+                        current_seq_len: 0,
+                        max_seq_len: 0,
+                        capacity_seq_len: 0,
+                    },
+                });
+                continue;
+            };
+            match cache_ref {
                 KvCache::Normal { k: old_k, .. } => {
                     let template_cache_dim = old_k.dim;
                     let template_cache_csl = old_k.current_seq_len;
@@ -594,20 +638,13 @@ impl Cache {
         cache: &mut Option<(Tensor, Tensor)>,
         k: Tensor,
         v: Tensor,
-        slow_cat: bool,
     ) -> Result<(Tensor, Tensor)> {
         let (k, v) = match &*cache {
             None => (k, v),
             Some((k_cache, v_cache)) => {
-                if !slow_cat {
-                    let k = candle_nn::ops::kvconcat(k_cache, &k, 2)?.contiguous()?;
-                    let v = candle_nn::ops::kvconcat(v_cache, &v, 2)?.contiguous()?;
-                    (k, v)
-                } else {
-                    let k = Tensor::cat(&[k_cache, &k], 2)?.contiguous()?;
-                    let v = Tensor::cat(&[v_cache, &v], 2)?.contiguous()?;
-                    (k, v)
-                }
+                let k = Tensor::cat(&[k_cache, &k], 2)?.contiguous()?;
+                let v = Tensor::cat(&[v_cache, &v], 2)?.contiguous()?;
+                (k, v)
             }
         };
         *cache = Some((k.clone(), v.clone()));
@@ -621,7 +658,6 @@ impl Cache {
         v: Tensor,
         attention_mask: Option<&Tensor>,
         sliding_window: Option<usize>,
-        slow_cat: bool,
     ) -> Result<(Tensor, Tensor, Option<Tensor>)> {
         let (k, v, attention_mask) = match cache.clone() {
             None => (k, v, attention_mask.cloned()),
@@ -654,11 +690,7 @@ impl Cache {
                         }
                     }
                 }
-                let (k, v) = if !slow_cat {
-                    let k = candle_nn::ops::kvconcat(&prev_k, &k, 2)?;
-                    let v = candle_nn::ops::kvconcat(&prev_v, &v, 2)?;
-                    (k, v)
-                } else {
+                let (k, v) = {
                     let k = Tensor::cat(&[prev_k, k], 2)?.contiguous()?;
                     let v = Tensor::cat(&[prev_v, v], 2)?.contiguous()?;
                     (k, v)

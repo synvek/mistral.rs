@@ -11,7 +11,17 @@ Blazingly fast LLM inference.
 | <a href="https://ericlbuehler.github.io/mistral.rs/mistralrs/"><b>Rust Documentation</b></a> | <a href="https://github.com/EricLBuehler/mistral.rs/blob/master/mistralrs-pyo3/API.md"><b>Python Documentation</b></a> | <a href="https://discord.gg/SZrecqK8qw"><b>Discord</b></a> | <a href="https://matrix.to/#/#mistral.rs:matrix.org"><b>Matrix</b></a> |
 </p>
 
-Mistral.rs is a cross-platform, highly multimodal inference engine featuring support for **text**, **vision**, **image generation**, and **speech generation** models!
+<p align="center">
+  <a href="https://github.com/EricLBuehler/mistral.rs/stargazers">
+    <img src="https://img.shields.io/github/stars/EricLBuehler/mistral.rs?style=social&label=Star" alt="GitHub stars">
+  </a>
+</p>
+
+**Mistral.rs is a cross-platform, highly-multimodal inference engine that brings you:**
+- All-in-one multimodal workflow: text↔text, text+vision↔text, text+vision+audio↔text, text→speech, text→image
+- APIs: Rust, Python, OpenAI HTTP server (with Chat Completions, Responses API), MCP server
+- 🔗 **MCP Client**: Connect to external tools and services automatically (file systems, web search, databases, APIs)
+- Performance: ISQ, PagedAttention, FlashAttention
 
 Please submit requests for new models [here](https://github.com/EricLBuehler/mistral.rs/issues/156).
 
@@ -26,6 +36,7 @@ Please submit requests for new models [here](https://github.com/EricLBuehler/mis
     - [Rust](mistralrs/examples)
     - [OpenAI-compatible HTTP server](README.md#openai-http-server)
     - [Interactive mode](README.md#interactive-mode)
+    - 🔗 [**MCP Client**](examples/MCP_QUICK_START.md) - Connect to external tools automatically
 
 4) Try the **web chat app** for local in-browser conversation (text, vision, and speech support):
     - Quickstart [here](mistralrs-web-chat/README.md)
@@ -56,6 +67,40 @@ Please submit requests for new models [here](https://github.com/EricLBuehler/mis
 ## Quick examples
 
 *After following installation instructions*
+
+- 💎🪆💎🪆💎 Run the **Gemma 3n** family (E2B, E4B) with **vision**, **audio**, and **MatFormer** support: [documentation](docs/GEMMA3N.md)  
+  <details>
+    <summary>Show commands</summary>
+
+    **Normal use, run the full model (E4B or E2B):**
+    ```bash
+    ./mistralrs-server -i --isq 8 run -m google/gemma-3n-E4B-it
+    ```
+
+    **Use [MatFormer](docs/GEMMA3N.md#using-matformer-with-gemma-3n) to get a balanced smaller model:**
+    ```bash
+    ./mistralrs-server -i --isq 8 run -m google/gemma-3n-E4B-it \
+      --matformer-config-path matformer_configs/gemma3n.csv \
+      --matformer-slice-name "Config for E2.49B (block-level)"
+    ```
+  </details>
+  
+
+- 🤗🤗🤗 Run the **SmolLM 3** long-context hybrid-reasoning model with full tool-calling support: [documentation](docs/SMOLLM3.md)  
+  <details>
+    <summary>Show command</summary>
+
+    **Default, easiest:**
+    ```bash
+    ./mistralrs-server -i --isq 8 run -m HuggingFaceTB/SmolLM3-3B
+    ```
+
+    **UQFF prequantized:**
+    ```bash
+    ./mistralrs-server -i run -m EricB/SmolLM3-3B-UQFF -f smollm33b-q4k-0.uqff
+    ```
+  </details>
+
 - 🔊 Run the **Dia 1.6b** model for highly-realistic dialogue generation: [documentation](docs/DIA.md)  
   <details>
     <summary>Show command</summary>
@@ -67,7 +112,7 @@ Please submit requests for new models [here](https://github.com/EricLBuehler/mis
 
 - 🦙 Run the **Llama 3.\* and Llama 4** models with long context & vision support: [docs (llama 3.2)](docs/VLLAMA.md), [docs (llama 4)](docs/LLAMA4.md)  
   <details>
-    <summary>Show command</summary>
+    <summary>Show commands</summary>
 
     **Llama 4:**
 
@@ -116,6 +161,64 @@ Please submit requests for new models [here](https://github.com/EricLBuehler/mis
     ```
   </details>
 
+- 🔗 **MCP Client** - Connect to external tools and services automatically: [**Quick Start Guide**](examples/MCP_QUICK_START.md)  
+  <details>
+    <summary>Show examples</summary>
+
+    **1. Create config file (`mcp-config.json`):**
+    ```json
+    {
+      "servers": [{
+        "name": "Filesystem Tools",
+        "source": {
+          "type": "Process",
+          "command": "npx",
+          "args": ["@modelcontextprotocol/server-filesystem", "/tmp", "-y"]
+        }
+      }],
+      "auto_register_tools": true
+    }
+    ```
+
+    **2. Start server with tools:**
+    ```bash
+    ./mistralrs-server --mcp-config mcp-config.json --port 1234 run -m Qwen/Qwen3-4B
+    ```
+    
+    **3. Tools work automatically:**
+    ```bash
+    curl -X POST http://localhost:1234/v1/chat/completions \
+      -d '{"model":"Qwen/Qwen3-4B","messages":[{"role":"user","content":"List files in /tmp and create hello.txt"}]}'
+    ```
+
+    **Python API:**
+    ```python
+    mcp_config = mistralrs.McpClientConfigPy(
+        servers=[mistralrs.McpServerConfigPy(
+            name="Filesystem",
+            source=mistralrs.McpServerSourcePy.Process(
+                command="npx", 
+                args=["@modelcontextprotocol/server-filesystem", "/tmp", "-y"]
+            )
+        )],
+        auto_register_tools=True
+    )
+    
+    runner = mistralrs.Runner(
+        which=mistralrs.Which.Plain(model_id="Qwen/Qwen3-4B"),
+        mcp_client_config=mcp_config
+    )
+    # Tools automatically available!
+    ```
+
+    **Rust API:**
+    ```rust
+    let model = TextModelBuilder::new("Qwen/Qwen3-4B")
+        .with_mcp_client(mcp_config) // Tools automatically available!
+        .build().await?;
+    ```
+  </details>
+
 ## Description
 
 [mistral.rs](https://github.com/EricLBuehler/mistral.rs) is a blazing-fast, cross-platform LLM inference engine with support for text, vision, image generation, and speech.
@@ -127,10 +230,12 @@ Please submit requests for new models [here](https://github.com/EricLBuehler/mis
    - [Rust API](https://ericlbuehler.github.io/mistral.rs/mistralrs/) & [Python API](mistralrs-pyo3/API.md)
    - [Automatic device mapping](docs/DEVICE_MAPPING.md) (multi-GPU, CPU)
    - [Chat templates](docs/CHAT_TOK.md) & tokenizer auto-detection
+   - [MCP server](docs/MCP/server.md) for structured, realtime tool calls
+   - ⭐ [MCP client](examples/MCP_QUICK_START.md) to connect to external tools and services automatically
 
 2. **Performance**
-   - CPU acceleration (MKL, AVX, [NEON](docs/DEVICE_MAPPING.md#arm-neon), [Accelerate](docs/DEVICE_MAPPING.md#apple-accelerate))
-   - GPU acceleration ([CUDA](docs/HTTP.md#cuda-support) with [FlashAttention](docs/FLASH_ATTENTION.md) & [cuDNN](docs/HTTP.md#cudnn-support), [Metal](docs/HTTP.md#apple-silicon-support))
+   - CPU acceleration (MKL, AVX, NEON, Accelerate)
+   - GPU acceleration (CUDA with [FlashAttention](docs/FLASH_ATTENTION.md) & cuDNN, Metal)
    - Automatic [tensor parallelism](docs/DISTRIBUTED/DISTRIBUTED.md) for splitting models across multiple devices
      - CUDA-specialized [NCCL](docs/DISTRIBUTED/NCCL.md)
      - Heterogeneous, flexible [Ring backend](docs/DISTRIBUTED/RING.md)
@@ -138,22 +243,23 @@ Please submit requests for new models [here](https://github.com/EricLBuehler/mis
 3. **Quantization**
    - [In-place quantization (ISQ)](docs/ISQ.md) of Hugging Face models
    - [GGML & GGUF support](docs/QUANTS.md): 2–8 bit
-   - [GPTQ](docs/QUANTS.md), [AWQ](scripts/convert_awq_marlin.py), [AFQ](docs/QUANTS.md#afq), [HQQ](docs/QUANTS.md#hqq), [FP8](docs/QUANTS.md), [BNB](https://github.com/TimDettmers/bitsandbytes) (int8/fp4/nf4)
+   - [GPTQ](docs/QUANTS.md), [AWQ](scripts/convert_awq_marlin.py), [AFQ](docs/QUANTS.md), [HQQ](docs/QUANTS.md), [FP8](docs/QUANTS.md), [BNB](https://github.com/TimDettmers/bitsandbytes) (int8/fp4/nf4)
    - ⭐ Auto-select the fastest quant method
+   - [KV cache quantization](docs/PAGED_ATTENTION.md#kv-cache-quantization)
 
 4. **Flexibility**
    - [LoRA](docs/ADAPTER_MODELS.md) & [X-LoRA](docs/ADAPTER_MODELS.md) adapters with weight merging
    - [AnyMoE](docs/ANYMOE.md): create MoE models on any base model
    - [Sampling & penalty options](docs/SAMPLING.md)
    - Prompt chunking for large inputs
-   - Integrated [tool calling](docs/TOOL_CALLING.md)
+   - Integrated [tool calling](docs/TOOL_CALLING.md) with customizable Python/Rust native tool and search callbacks
 
 5. **Advanced Features**
    - High-throughput with [PagedAttention](docs/PAGED_ATTENTION.md) & FlashAttention V2/V3
    - Prefix caching (including multimodal)
    - Customizable quantization with [topology](docs/TOPOLOGY.md) & [UQFF format](docs/UQFF.md)
    - Speculative decoding across models
-   - ⭐ Agentic [web search integration](docs/TOOL_CALLING.md#agentic-web-search)
+   - ⭐ Agentic [web search integration](docs/WEB_SEARCH.md)
 
 ## APIs and Integrations
 
@@ -162,8 +268,9 @@ Please submit requests for new models [here](https://github.com/EricLBuehler/mis
 Rust multithreaded/async API for easy integration into any application.
 
 - [Docs](https://ericlbuehler.github.io/mistral.rs/mistralrs/)
-- [Examples](mistralrs/examples/)
+- [Examples](mistralrs/examples/) including [MCP client integration](mistralrs/examples/mcp_client)
 - To use: add `mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs.git" }` to your Cargo.toml
+- **MCP Client**: Connect to external tools automatically - [Quick Start](examples/MCP_QUICK_START.md)
 
 ### Python API
 
@@ -171,18 +278,30 @@ Python API for mistral.rs.
 
 - [Installation including PyPI](mistralrs-pyo3/_README.md)
 - [Docs](mistralrs-pyo3/API.md)
-- [Examples](examples/python)
+- [Examples](examples/python) including [MCP client usage](examples/python/mcp_client.py)
 - [Cookbook](examples/python/cookbook.ipynb)
-
+- **MCP Client**: Full MCP integration - [Quick Start](examples/MCP_QUICK_START.md)
 
 ### HTTP Server
 
 OpenAI API compatible API server
 
-- [API Docs](docs/HTTP.md).
-- [Launching the server or use the CLI](README.md#run-with-the-cli)
+- [API Docs](docs/HTTP.md) - includes chat completions, completions, and **Responses API** for stateful conversations
+- [Launching the server or use the CLI](README.md#using-the-cli)
 - [Example](examples/server/chat.py)
+- [Responses API examples](examples/server/responses.py) - maintain conversation context without resending history
 - [Use or extend the server in other axum projects](https://ericlbuehler.github.io/mistral.rs/mistralrs_server_core/)
+- **MCP Client**: Configure via `--mcp-config` flag for automatic tool integration - [Quick Start](examples/MCP_QUICK_START.md)
+
+### MCP Protocol
+
+Serve the same models over the open [MCP](docs/mcp/server.md) (Model Context Protocol) in parallel to the HTTP API:
+
+```bash
+./mistralrs-server --mcp-port 4321 plain -m Qwen/Qwen3-4B
+```
+
+See the [docs](docs/mcp/server.md) for feature flags, examples and limitations.
 
 
 ### Llama Index integration
@@ -206,6 +325,8 @@ To enable one or more features, pass them to Cargo. For example:
 ```bash
 cargo build --release --features "cuda flash-attn cudnn"
 ```
+
+> **Note for Linux users:** The `metal` feature is macOS-only and should not be used on Linux. Use `--features "cuda flash-attn cudnn"` for NVIDIA GPUs or `--features mkl` for Intel CPUs instead of `--all-features`.
 
 ## Installation and Build
 
@@ -357,6 +478,23 @@ You can launch an HTTP server by replacing `-i` with `--port <port>`. For instan
 
 You can find documentation about the server itself [here](docs/HTTP.md).
 
+### Multi-model support
+
+Serve multiple models simultaneously from a single server instance. Perfect for comparing models, A/B testing, or serving different models for different use cases.
+
+```bash
+./mistralrs-server --port 1234 multi-model --config example-multi-model-config.json --default-model-id meta-llama/Llama-3.2-3B-Instruct
+```
+
+Select models in your requests using the `model` parameter:
+```bash
+curl http://localhost:1234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "meta-llama/Llama-3.2-3B-Instruct", "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+📖 **[Complete multi-model documentation →](docs/multi_model/README.md)**
+
 ### Structured selection with a `.toml` file
 
 We provide a method to select models with a `.toml` file. The keys are the same as the command line, with `no_kv_cache` and `tokenizer_json` being "global" keys.
@@ -384,11 +522,13 @@ If you do not specify the architecture, an attempt will be made to use the model
 - `phi3.5moe`
 - `qwen2`
 - `gemma2`
+- `glm4`
 - `starcoder2`
 - `deepseekv2`
 - `deepseekv3`
 - `qwen3`
 - `qwen3moe`
+- `smollm3`
 
 </details>
 
@@ -412,6 +552,7 @@ If you do not specify the architecture, an attempt will be made to use the model
 - `gemma3`
 - `mistral3`
 - `llama4`
+- `gemma3n`
 
 </details>
 
@@ -426,6 +567,7 @@ If you do not specify the architecture, an attempt will be made to use the model
 - phi3
 - starcoder2
 - qwen2
+- qwen3
 
 **With adapters:**
 - llama
@@ -456,6 +598,7 @@ Please submit more benchmarks via raising an issue!
 |Phi 3 Vision| | |✅|
 |Idefics 2| | |✅|
 |Gemma 2| | |✅|
+|GLM4| | |✅|
 |Starcoder 2| |✅|✅|
 |LLaVa Next| | |✅|
 |LLaVa| | |✅|
@@ -469,8 +612,10 @@ Please submit more benchmarks via raising an issue!
 |Gemma 3| | |✅|
 |Mistral 3| | |✅|
 |Llama 4| | |✅|
-|Qwen 3| | |✅|
+|Qwen 3|✅| |✅|
+|SmolLM3| | |✅|
 |Dia 1.6b| | |✅|
+|Gemma 3n| | |✅|
 </details>
 
 <details>
@@ -502,6 +647,7 @@ Please submit more benchmarks via raising an issue!
 |Phi 3 Vision| | | |
 |Idefics 2| | | |
 |Gemma 2|✅| | |
+|GLM4|✅| | |
 |Starcoder 2|✅| | |
 |LLaVa Next| | | |
 |LLaVa| | | |
@@ -515,6 +661,8 @@ Please submit more benchmarks via raising an issue!
 |Mistral 3| | | |
 |Llama 4| | | |
 |Qwen 3| | | |
+|SmolLM3|✅| | |
+|Gemma 3n| | | |
 </details>
 
 <details>
@@ -548,6 +696,8 @@ Please submit more benchmarks via raising an issue!
 |Mistral 3|✅|
 |Llama 4| |
 |Qwen 3| |
+|SmolLM3|✅|
+|Gemma 3n| | | |
 </details>
 
 ### Using derivative and adapter models
@@ -610,6 +760,10 @@ If you want to add a new model, please contact us via an issue and we can coordi
 - Metal not found (error: unable to find utility "metal", not a developer tool or in PATH)
     1) Install Xcode: `xcode-select --install`
     2) Set the active developer directory: `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer`
+- Disabling Metal kernel precompilation:
+    - By default, Metal kernels are precompiled during build time for better performance
+    - To skip Metal kernel precompilation (useful for CI or when Metal is not needed), set `MISTRALRS_METAL_PRECOMPILE=0` or `MISTRALRS_METAL_PRECOMPILE=false`
+    - Example: `MISTRALRS_METAL_PRECOMPILE=0 cargo build --release --features metal`
   
 ## Credits
 This project would not be possible without the excellent work at [`candle`](https://github.com/huggingface/candle). Additionally, thank you to all contributors! Contributing can range from raising an issue or suggesting a feature to adding some new functionality.

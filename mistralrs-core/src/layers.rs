@@ -7,7 +7,8 @@ use candle_core::{
     Context, DType, Device, IndexOp, Result, Tensor, D,
 };
 use candle_nn::{
-    Conv2d, Conv2dConfig, Embedding, GroupNorm, LayerNorm, LayerNormConfig, Linear, Module,
+    BatchNorm, BatchNormConfig, Conv1d, Conv1dConfig, Conv2d, Conv2dConfig, Embedding, GroupNorm,
+    LayerNorm, LayerNormConfig, Linear, Module,
 };
 use float8::F8E4M3;
 use half::{bf16, f16};
@@ -23,10 +24,11 @@ pub use crate::layers_utils::repeat_kv;
 use crate::{
     amoe::{AnyMoeTrainableLayer, MlpLayer},
     gguf::Content,
-    models::llama,
+    models::{llama, smollm3},
     ops::SplitOp,
     vision_models::{
         gemma3::config::Gemma3TextConfig,
+        gemma3n::config::Gemma3nTextConfig,
         llama4,
         mllama::{MLlamaRopeScaling, MLlamaRopeType, MLlamaTextConfig},
         phi4::Phi4MMConfig,
@@ -64,6 +66,34 @@ pub fn layer_norm<C: Into<LayerNormConfig>>(
         Ok(LayerNorm::new(weight, bias, config.eps))
     } else {
         Ok(LayerNorm::new_no_bias(weight, config.eps))
+    }
+}
+
+pub fn batch_norm<C: Into<BatchNormConfig>>(
+    num_features: usize,
+    config: C,
+    vb: ShardedVarBuilder,
+) -> Result<BatchNorm> {
+    let config = config.into();
+    if config.eps < 0. {
+        candle_core::bail!("batch-norm eps cannot be negative {}", config.eps)
+    }
+    let running_mean = vb.get(num_features, "running_mean")?;
+    let running_var = vb.get(num_features, "running_var")?;
+
+    if config.affine {
+        let weight = vb.get(num_features, "weight")?;
+        let bias = vb.get(num_features, "bias")?;
+        BatchNorm::new(
+            num_features,
+            running_mean,
+            running_var,
+            weight,
+            bias,
+            config.eps,
+        )
+    } else {
+        BatchNorm::new_no_bias(num_features, running_mean, running_var, config.eps)
     }
 }
 
@@ -117,6 +147,35 @@ pub fn conv2d_no_bias(
     Ok(Conv2d::new(ws, None, cfg))
 }
 
+pub fn conv1d(
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    cfg: Conv1dConfig,
+    vb: ShardedVarBuilder,
+) -> Result<Conv1d> {
+    let ws = vb.get(
+        (out_channels, in_channels / cfg.groups, kernel_size),
+        "weight",
+    )?;
+    let bs = vb.get(out_channels, "bias")?;
+    Ok(Conv1d::new(ws, Some(bs), cfg))
+}
+
+pub fn conv1d_no_bias(
+    in_channels: usize,
+    out_channels: usize,
+    kernel_size: usize,
+    cfg: Conv1dConfig,
+    vb: ShardedVarBuilder,
+) -> Result<Conv1d> {
+    let ws = vb.get(
+        (out_channels, in_channels / cfg.groups, kernel_size),
+        "weight",
+    )?;
+    Ok(Conv1d::new(ws, None, cfg))
+}
+
 pub fn linear(in_dim: usize, out_dim: usize, vb: ShardedVarBuilder) -> Result<Linear> {
     let ws = vb.get((out_dim, in_dim), "weight")?;
     let bs = vb.get(out_dim, "bias")?;
@@ -157,6 +216,21 @@ impl RmsNorm {
     pub fn new_gemma(size: usize, eps: f64, vb: ShardedVarBuilder) -> Result<Self> {
         let w = vb.get(size, "weight")?;
         let w = (w + 1.0)?;
+        Ok(Self { eps, weight: w })
+    }
+
+    /// Gemma 3n uses weight
+    pub fn new_gemma_3n(
+        size: usize,
+        eps: f64,
+        with_scale: bool,
+        vb: ShardedVarBuilder,
+    ) -> Result<Self> {
+        let w = if with_scale {
+            vb.get(size, "weight")?
+        } else {
+            Tensor::ones(size, vb.dtype(), vb.device())?
+        };
         Ok(Self { eps, weight: w })
     }
 
@@ -912,6 +986,139 @@ impl Llama3RotaryEmbedding {
     }
 }
 
+/// RoPE for SmolLm3
+#[derive(Debug, Clone)]
+pub struct SmolLm3RotaryEmbedding(RotaryEmbedding);
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub enum SmolLm3RopeType {
+    #[serde(rename = "llama3")]
+    Llama3,
+    #[serde(rename = "linear")]
+    Linear,
+    #[default]
+    #[serde(rename = "default")]
+    Default,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct SmolLm3RopeConfig {
+    pub factor: f32,
+    pub low_freq_factor: Option<f32>,
+    pub high_freq_factor: Option<f32>,
+    pub original_max_position_embeddings: Option<usize>,
+    pub rope_type: SmolLm3RopeType,
+}
+
+fn calculate_default_inv_freq_smollm3(cfg: &smollm3::Config) -> Vec<f32> {
+    let head_dim = cfg.hidden_size / cfg.num_attention_heads;
+    (0..head_dim)
+        .step_by(2)
+        .map(|i| 1f32 / cfg.rope_theta.powf(i as f32 / head_dim as f32))
+        .collect()
+}
+
+impl SmolLm3RotaryEmbedding {
+    pub fn new_llama3(
+        dtype: DType,
+        cfg: &smollm3::Config,
+        dev: &Device,
+        is_gpt_neox: bool,
+    ) -> Result<Self> {
+        match &cfg.rope_scaling {
+            None
+            | Some(SmolLm3RopeConfig {
+                rope_type: SmolLm3RopeType::Default,
+                ..
+            }) => Ok(Self(RotaryEmbedding::new(
+                cfg.rope_theta,
+                cfg.hidden_size / cfg.num_attention_heads,
+                cfg.max_position_embeddings,
+                dev,
+                is_gpt_neox,
+                dtype,
+            )?)),
+            Some(SmolLm3RopeConfig {
+                rope_type: SmolLm3RopeType::Llama3,
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position_embeddings,
+            }) => {
+                let low_freq_factor = low_freq_factor.context("low_freq_factor is required")?;
+                let high_freq_factor = high_freq_factor.context("high_freq_factor is required")?;
+                let original_max_position_embeddings = original_max_position_embeddings
+                    .context("original_max_position_embeddings is required")?;
+
+                let low_freq_wavelen = original_max_position_embeddings as f32 / low_freq_factor;
+                let high_freq_wavelen = original_max_position_embeddings as f32 / high_freq_factor;
+
+                let inv_freq = calculate_default_inv_freq_smollm3(cfg)
+                    .into_iter()
+                    .map(|freq| {
+                        let wavelen = 2. * PI / freq;
+                        if wavelen < high_freq_wavelen {
+                            freq
+                        } else if wavelen > low_freq_wavelen {
+                            freq / *factor
+                        } else {
+                            let smooth = (original_max_position_embeddings as f32 / wavelen
+                                - low_freq_factor)
+                                / (high_freq_factor - low_freq_factor);
+                            (1. - smooth) * freq / *factor + smooth * freq
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let inv_freq_len = inv_freq.len();
+                let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
+                let t = Tensor::arange(0u32, cfg.max_position_embeddings as u32, dev)?
+                    .to_dtype(DType::F32)?
+                    .reshape((cfg.max_position_embeddings, 1))?;
+                let freqs = t.matmul(&inv_freq)?;
+                let sin = freqs.sin()?.to_dtype(dtype)?;
+                let cos = freqs.cos()?.to_dtype(dtype)?;
+                Ok(Self(RotaryEmbedding {
+                    sin,
+                    cos,
+                    is_gpt_neox,
+                }))
+            }
+            Some(SmolLm3RopeConfig {
+                rope_type: SmolLm3RopeType::Linear,
+                factor,
+                ..
+            }) => {
+                let inv_freq_vec = calculate_default_inv_freq_smollm3(cfg)
+                    .into_iter()
+                    .map(|freq| freq / *factor)
+                    .collect::<Vec<_>>();
+                let inv_freq_len = inv_freq_vec.len();
+                let inv_freq = Tensor::from_vec(inv_freq_vec, (1, inv_freq_len), dev)?;
+                let t = Tensor::arange(0u32, cfg.max_position_embeddings as u32, dev)?
+                    .to_dtype(DType::F32)?
+                    .reshape((cfg.max_position_embeddings, 1))?;
+                let freqs = t.matmul(&inv_freq)?;
+                let sin = freqs.sin()?.to_dtype(dtype)?;
+                let cos = freqs.cos()?.to_dtype(dtype)?;
+                Ok(Self(RotaryEmbedding {
+                    sin,
+                    cos,
+                    is_gpt_neox,
+                }))
+            }
+        }
+    }
+
+    pub fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        self.0.forward(q, k, seqlen_offsets)
+    }
+}
+
 // https://github.com/huggingface/transformers/blob/f2c388e3f946862f657acc1e21b272ec946fc66c/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L107
 #[derive(Debug, Clone)]
 pub struct Qwen2VLRotaryEmbedding {
@@ -1477,6 +1684,84 @@ impl Phi4MMRotaryEmbedding {
 }
 
 #[derive(Debug, Clone)]
+pub struct Gemma3nRotaryEmbedding(RotaryEmbedding);
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gemma3nScaledRopeType {
+    #[serde(alias = "linear")]
+    Linear,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Gemma3nRopeScalingConfig {
+    factor: f64,
+    rope_type: Gemma3nScaledRopeType,
+}
+
+impl Gemma3nRotaryEmbedding {
+    fn new_linear(
+        cfg: &Gemma3nTextConfig,
+        factor: f64,
+        is_gpt_neox: bool,
+        dtype: DType,
+        dev: &Device,
+    ) -> Result<Self> {
+        let max_seq_len = cfg.max_position_embeddings;
+        let dim = cfg.head_dim;
+
+        let inv_freq: Vec<_> = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?;
+        let inv_freq = (inv_freq / factor)?;
+
+        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+            .to_dtype(DType::F32)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+        let sin = freqs.sin()?.to_dtype(dtype)?;
+        let cos = freqs.cos()?.to_dtype(dtype)?;
+        Ok(Self(RotaryEmbedding {
+            cos,
+            sin,
+            is_gpt_neox,
+        }))
+    }
+
+    pub fn new(
+        is_gpt_neox: bool,
+        dtype: DType,
+        cfg: &Gemma3nTextConfig,
+        dev: &Device,
+    ) -> Result<Self> {
+        match &cfg.rope_scaling {
+            Some(Gemma3RopeScalingConfig {
+                rope_type: Gemma3ScaledRopeType::Linear,
+                factor,
+            }) => Self::new_linear(cfg, *factor, is_gpt_neox, dtype, dev),
+
+            _ => Self::new_linear(cfg, 1.0, is_gpt_neox, dtype, dev),
+        }
+    }
+
+    pub fn get_cos_sin(&self) -> Result<(Tensor, Tensor)> {
+        self.0.get_cos_sin()
+    }
+
+    pub fn forward(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        seqlen_offsets: &[usize],
+    ) -> Result<(Tensor, Tensor)> {
+        self.0.forward(q, k, seqlen_offsets)
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Gemma3RotaryEmbedding(RotaryEmbedding);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1732,6 +2017,10 @@ impl RotaryEmbedding {
         })
     }
 
+    pub fn get_cos_sin(&self) -> Result<(Tensor, Tensor)> {
+        Ok((self.cos.clone(), self.sin.clone()))
+    }
+
     pub fn new_partial(
         base: f32,
         rot_dim: usize,
@@ -1958,6 +2247,7 @@ impl Conv3dNoBias {
             stride: cfg.stride,
             dilation: cfg.dilation,
             groups: cfg.groups,
+            cudnn_fwd_algo: None,
         };
 
         Ok(Self {
@@ -2001,6 +2291,9 @@ impl TensorInfExtend for Tensor {
             DType::F32 => Ok(sum.to_scalar::<f32>()? == 0.),
             DType::F64 => Ok(sum.to_scalar::<f64>()? == 0.),
             DType::F8E4M3 => Ok(sum.to_scalar::<F8E4M3>()? == F8E4M3::ZERO),
+            DType::F4 | DType::F6E3M2 | DType::F6E2M3 | DType::F8E8M0 => {
+                candle_core::bail!("f4/f6e3m2/f6e2m3/f8e8m0 tensors are not supported with .any")
+            }
         }
     }
 }
@@ -2017,6 +2310,9 @@ pub fn clamp_for_f16(xs: &Tensor) -> Result<Tensor> {
         DType::F32 => f32::MAX - 1000.,
         DType::F64 => f64::MAX as f32 - 1000.,
         DType::F8E4M3 => F8E4M3::MAX.to_f32() - 1000.,
+        DType::F4 | DType::F6E3M2 | DType::F6E2M3 | DType::F8E8M0 => {
+            candle_core::bail!("f4/f6e3m2/f6e2m3/f8e8m0 tensors are not supported with .any")
+        }
     };
     if xs.is_inf()?.any()? {
         max -= 1000.;
@@ -2127,6 +2423,42 @@ impl Mlp {
         })
     }
 
+    pub fn new_merged(
+        vb: ShardedVarBuilder,
+        hidden_size: usize,
+        intermediate_size: usize,
+        chunks: usize,
+        quantization_config: &Option<QuantizedConfig>,
+        hidden_act: Activation,
+        comm: &Arc<mistralrs_quant::Comm>,
+    ) -> Result<Self> {
+        assert!(chunks == 2, "Only gate_up_proj merge is supported!");
+        let gate_up_projs = ColumnParallelLayer::new_merged(
+            hidden_size,
+            intermediate_size * 2,
+            2,
+            quantization_config,
+            false,
+            comm,
+            vb.pp("gate_up_proj"),
+        )?;
+
+        Ok(Self {
+            gate: gate_up_projs[0].to_owned(),
+            up: gate_up_projs[1].to_owned(),
+            down: RowParallelLayer::new(
+                intermediate_size,
+                hidden_size,
+                quantization_config,
+                false,
+                comm,
+                vb.pp("down_proj"),
+            )?,
+            act: hidden_act,
+            params: vec![hidden_size, intermediate_size],
+        })
+    }
+
     pub fn replicate(
         params: &[usize],
         vb: ShardedVarBuilder,
@@ -2144,11 +2476,9 @@ impl Mlp {
         }
         let lhs = self.gate.forward(&xs)?;
         let rhs = self.up.forward(&xs)?;
-        let mut res = self.down.forward(&candle_nn::ops::mul_and_act(
-            &lhs,
-            &rhs,
-            self.act.try_into()?,
-        )?)?;
+        let mut res = self
+            .down
+            .forward(&crate::ops::mul_and_act(&lhs, &rhs, self.act)?)?;
         if self.gate.quantized_act_type().is_some() {
             res = res.to_dtype(original_dtype)?;
         }
@@ -2167,17 +2497,8 @@ impl MlpLayer for Mlp {
         }
         let lhs = MatMul.qmethod_matmul(&xs, &*self.gate)?;
         let rhs = MatMul.qmethod_matmul(&xs, &*self.up)?;
-        let mut res = if matches!(
-            self.act,
-            Activation::Gelu | Activation::Silu | Activation::Relu
-        ) {
-            MatMul.qmethod_matmul(
-                &candle_nn::ops::mul_and_act(&lhs, &rhs, self.act.try_into()?)?,
-                &*self.down,
-            )?
-        } else {
-            MatMul.qmethod_matmul(&(&lhs.apply(&self.act)? * &rhs)?, &*self.down)?
-        };
+        let mut res =
+            MatMul.qmethod_matmul(&crate::ops::mul_and_act(&lhs, &rhs, self.act)?, &*self.down)?;
         if self.gate.quantized_act_type().is_some() {
             res = res.to_dtype(original_dtype)?;
         }
@@ -2327,21 +2648,25 @@ impl Module for ReflectionPad2d {
 
 pub struct ScaledEmbedding {
     scale: f64,
-    embedding: Embedding,
+    pub embedding: Tensor,
 }
 
 impl ScaledEmbedding {
     pub fn new(scale: f64, embedding: Embedding) -> Self {
-        Self { scale, embedding }
+        Self {
+            scale,
+            embedding: embedding.embeddings().clone(),
+        }
     }
 
     pub fn embeddings(&self) -> &Tensor {
-        self.embedding.embeddings()
+        &self.embedding
     }
 }
 
 impl Module for ScaledEmbedding {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        xs.apply(&self.embedding)? * self.scale
+        let embedding = Embedding::new(self.embedding.clone(), self.embedding.dim(D::Minus1)?);
+        xs.apply(&embedding)? * self.scale
     }
 }

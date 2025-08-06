@@ -34,10 +34,13 @@
 
 ## Other
 - [Chat templates and tokenizers](CHAT_TOK.md)
+- [Multi-model support](multi_model/README.md) - Serve multiple models simultaneously
 - [Paged Attention](PAGED_ATTENTION.md)
 - [Sampling](SAMPLING.md)
 - [TOML selector](TOML_SELECTOR.md)
 - [Tool calling](TOOL_CALLING.md)
+- [MCP Client](mcp/README.md)
+- [MCP Server](mcp/server.md)
 
 ## Cross-device inference
 - [Device mapping](DEVICE_MAPPING.md)

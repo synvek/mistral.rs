@@ -26,10 +26,13 @@ mod gptq;
 mod hqq;
 mod imatrix;
 mod lora;
+mod mxfp4;
 pub mod rotary;
 pub mod safetensors;
+mod scalar_fp8;
 mod unquantized;
 mod utils;
+mod vector_fp8;
 
 use gptq::gptq_linear;
 use lora::merge_lora_weights;
@@ -38,6 +41,7 @@ pub use safetensors::{Shard, ShardedSafeTensors, ShardedVarBuilder};
 
 pub use afq::{AfqBits, AfqGroupSize, AfqLayer};
 pub use bitsandbytes::{BnbLinear, BnbQuantParmas, BnbQuantType};
+pub use blockwise_fp8::{fp8_blockwise_dequantize, fp8_blockwise_quantize};
 pub use distributed::{
     layers::{
         compute_kv_shard, compute_n_kv_groups, ColumnParallelLayer, FusedExperts, PackedExperts,
@@ -53,12 +57,14 @@ pub use gptq::GptqLayer;
 pub use hqq::{HqqAxis, HqqBits, HqqConfig, HqqLayer};
 pub use imatrix::{CollectedImatrixData, ImatrixLayerStats};
 pub use lora::{
-    linear_no_bias_static_lora, LoraAdapter, LoraConfig, StaticLoraConfig, APPLIED_LORAS,
-    MULTI_LORA_DELIMITER,
+    clear_applied_loras, get_applied_loras, linear_no_bias_static_lora, push_applied_lora,
+    LoraAdapter, LoraConfig, StaticLoraConfig, MULTI_LORA_DELIMITER,
 };
+pub use mxfp4::MXFP4Layer;
 pub use unquantized::UnquantLinear;
 pub use utils::isq::apply_immediate_isq;
 pub use utils::{log, BitWiseOp, CumSumOp, LeftshiftOp, NonZeroOp, SortOp, UQFF_QUANT_TYPE_OFFSET};
+pub use vector_fp8::{fp8_vector_dequantize, fp8_vector_quantize};
 
 use candle_nn::{Linear, Module};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -70,19 +76,28 @@ pub struct ImmediateIsqParams {
     pub predicates: Vec<Regex>,
 }
 
-static IMMEDIATE_ISQ: Mutex<Option<ImmediateIsqParams>> = Mutex::new(None);
+thread_local! {
+    static ENGINE_IMMEDIATE_ISQ: std::cell::RefCell<Option<ImmediateIsqParams>> = const { std::cell::RefCell::new(None) } ;
+}
 
 pub fn set_immediate_isq(isq: Option<IsqType>, predicates: Vec<Regex>) {
-    let mut guard = IMMEDIATE_ISQ.lock().expect("IMMEDIATE_ISQ mutex poisoned");
-    *guard = Some(ImmediateIsqParams {
-        guard: QuantizeOntoGuard::new(),
-        ty: isq,
-        predicates,
+    ENGINE_IMMEDIATE_ISQ.with(|cell| {
+        *cell.borrow_mut() = Some(ImmediateIsqParams {
+            guard: QuantizeOntoGuard::new(),
+            ty: isq,
+            predicates,
+        });
     });
 }
 
 pub fn get_immediate_isq() -> Option<ImmediateIsqParams> {
-    IMMEDIATE_ISQ.lock().ok().and_then(|guard| guard.clone())
+    ENGINE_IMMEDIATE_ISQ.with(|cell| cell.borrow().clone())
+}
+
+pub fn clear_immediate_isq() {
+    ENGINE_IMMEDIATE_ISQ.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
 }
 
 pub fn should_apply_immediate_isq(vb: &ShardedVarBuilder) -> bool {
@@ -117,6 +132,7 @@ pub enum QuantizedConfig {
         bits: usize,
         group_size: usize,
     },
+    MXFP4 {},
 }
 
 // Common fields for all variants
@@ -171,6 +187,9 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
                     .ok_or_else(|| serde::de::Error::missing_field("group_size"))?;
                 Ok(QuantizedConfig::Afq { bits, group_size })
             }
+            Some(m) if m == "mxfp4" => {
+                Ok(QuantizedConfig::MXFP4 {  })
+            }
             None => {
                 let bits = raw
                     .bits
@@ -182,8 +201,7 @@ impl<'de> Deserialize<'de> for QuantizedConfig {
             }
             Some(unknown_method) => {
                 Err(serde::de::Error::custom(format!(
-                    "Unknown quantization method: {}. Expected one of: gptq, fp8, bitsandbytes, afq, or not specified", 
-                    unknown_method
+                    "Unknown quantization method: {unknown_method}. Expected one of: gptq, fp8, bitsandbytes, afq, or not specified"
                 )))
             },
         }
@@ -197,6 +215,7 @@ impl QuantizedConfig {
             Self::Fp8 { .. } => "fp8",
             Self::Bitsandbytes { .. } => "bitsandbytes",
             Self::Afq { .. } => "afq",
+            Self::MXFP4 { .. } => "mxfp4",
         }
     }
 
@@ -211,6 +230,7 @@ impl QuantizedConfig {
                 bnb_4bit_quant_type: None,
             } => "8 bits".to_string(),
             Self::Afq { bits, .. } => format!("{bits} bits"),
+            Self::MXFP4 {} => format!("{} bits", mxfp4::N_BITS),
         }
     }
 
@@ -223,6 +243,7 @@ impl QuantizedConfig {
                 5 => IsqType::Q5K.pack_factor(dtype),
                 6 => IsqType::Q6K.pack_factor(dtype),
                 8 => IsqType::Q8_0.pack_factor(dtype),
+                40 => 4, // mxfp4: 2 FP4 values per byte = factor of 4
                 other => panic!("Unexpected bits in `pack_factor` {other}"),
             },
             Self::Fp8 { .. } => IsqType::Q8_0.pack_factor(dtype),
@@ -232,6 +253,7 @@ impl QuantizedConfig {
             | Self::Bitsandbytes {
                 bnb_4bit_quant_type: None,
             } => IsqType::Q4K.pack_factor(dtype),
+            Self::MXFP4 {} => IsqType::Q4_0.pack_factor(dtype),
         }
     }
 }
@@ -288,6 +310,11 @@ pub enum QuantMethodConfig {
         bias: Option<Tensor>,
         bits: AfqBits,
         group_size: AfqGroupSize,
+    },
+    MXFP4 {
+        blocks: Tensor,
+        scales: Tensor,
+        bias: Option<Tensor>,
     },
 }
 
@@ -735,6 +762,9 @@ pub fn linear_no_bias(
             QuantizedConfig::Afq { .. } => {
                 AfqLayer::afq_linear_b(in_dim, out_dim, quant_conf, false, vb)?
             }
+            QuantizedConfig::MXFP4 {} => {
+                MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, false, vb)?
+            }
         }
     } else {
         // Handle the case where the layer is dummy (no tensors)
@@ -778,6 +808,9 @@ pub fn linear(
             }
             QuantizedConfig::Afq { .. } => {
                 AfqLayer::afq_linear_b(in_dim, out_dim, quant_conf, true, vb)?
+            }
+            QuantizedConfig::MXFP4 {} => {
+                MXFP4Layer::linear_b(in_dim, out_dim, quant_conf, true, vb)?
             }
         }
     } else {

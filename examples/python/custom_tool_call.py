@@ -1,11 +1,12 @@
+import json
+import os
 from mistralrs import (
     Runner,
     Which,
     ChatCompletionRequest,
     Architecture,
-    WebSearchOptions,
+    ToolChoice,
 )
-import os
 
 
 def local_search(query: str):
@@ -30,23 +31,41 @@ def local_search(query: str):
     return results
 
 
+def tool_cb(name: str, args: dict) -> str:
+    if name == "local_search":
+        return json.dumps(local_search(args.get("query", "")))
+    return ""
+
+
+schema = json.dumps(
+    {
+        "type": "function",
+        "function": {
+            "name": "local_search",
+            "description": "Local filesystem search",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+            },
+        },
+    }
+)
+
 runner = Runner(
     which=Which.Plain(
-        model_id="NousResearch/Hermes-3-Llama-3.1-8B",
-        arch=Architecture.Llama,
+        model_id="NousResearch/Hermes-3-Llama-3.1-8B", arch=Architecture.Llama
     ),
-    enable_search=True,
-    search_callback=local_search,
+    tool_callbacks={"local_search": tool_cb},
 )
 
 res = runner.send_chat_completion_request(
     ChatCompletionRequest(
-        model="mistral",
+        model="default",
         messages=[{"role": "user", "content": "Where is Cargo.toml in this repo?"}],
         max_tokens=64,
-        web_search_options=WebSearchOptions(
-            search_description="Local filesystem search"
-        ),
+        tool_schemas=[schema],
+        tool_choice=ToolChoice.Auto,
     )
 )
 print(res.choices[0].message.content)

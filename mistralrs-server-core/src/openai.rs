@@ -7,9 +7,10 @@ use mistralrs_core::{
     ImageGenerationResponseFormat, LlguidanceGrammar, Tool, ToolChoice, ToolType, WebSearchOptions,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use utoipa::{
-    openapi::{ArrayBuilder, ObjectBuilder, OneOfBuilder, RefOr, Schema, SchemaType},
-    ToSchema,
+    openapi::{schema::SchemaType, ArrayBuilder, ObjectBuilder, OneOfBuilder, RefOr, Schema, Type},
+    PartialSchema, ToSchema,
 };
 
 /// Inner content structure for messages that can be either a string or key-value pairs
@@ -20,12 +21,23 @@ pub struct MessageInnerContent(
 
 // The impl Deref was preventing the Derive ToSchema and #[schema] macros from
 // properly working, so manually impl ToSchema
-impl ToSchema<'_> for MessageInnerContent {
-    fn schema() -> (&'static str, RefOr<Schema>) {
-        (
-            "MessageInnerContent",
-            RefOr::T(message_inner_content_schema()),
-        )
+impl PartialSchema for MessageInnerContent {
+    fn schema() -> RefOr<Schema> {
+        RefOr::T(message_inner_content_schema())
+    }
+}
+
+impl ToSchema for MessageInnerContent {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        schemas.push((
+            MessageInnerContent::name().into(),
+            MessageInnerContent::schema(),
+        ));
     }
 }
 
@@ -42,14 +54,18 @@ fn message_inner_content_schema() -> Schema {
         OneOfBuilder::new()
             // Either::Left - simple string
             .item(Schema::Object(
-                ObjectBuilder::new().schema_type(SchemaType::String).build(),
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(Type::String))
+                    .build(),
             ))
             // Either::Right - object with string values
             .item(Schema::Object(
                 ObjectBuilder::new()
-                    .schema_type(SchemaType::Object)
+                    .schema_type(SchemaType::Type(Type::Object))
                     .additional_properties(Some(RefOr::T(Schema::Object(
-                        ObjectBuilder::new().schema_type(SchemaType::String).build(),
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::Type(Type::String))
+                            .build(),
                     ))))
                     .build(),
             ))
@@ -66,9 +82,52 @@ pub struct MessageContent(
 
 // The impl Deref was preventing the Derive ToSchema and #[schema] macros from
 // properly working, so manually impl ToSchema
-impl ToSchema<'_> for MessageContent {
-    fn schema() -> (&'static str, RefOr<Schema>) {
-        ("MessageContent", RefOr::T(message_content_schema()))
+impl PartialSchema for MessageContent {
+    fn schema() -> RefOr<Schema> {
+        RefOr::T(message_content_schema())
+    }
+}
+
+impl ToSchema for MessageContent {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        schemas.push((MessageContent::name().into(), MessageContent::schema()));
+    }
+}
+
+impl MessageContent {
+    /// Create a new MessageContent from a string
+    pub fn from_text(text: String) -> Self {
+        MessageContent(Either::Left(text))
+    }
+
+    /// Extract text from MessageContent
+    pub fn to_text(&self) -> Option<String> {
+        match &self.0 {
+            Either::Left(text) => Some(text.clone()),
+            Either::Right(parts) => {
+                // For complex content, try to extract text from parts
+                let mut text_parts = Vec::new();
+                for part in parts {
+                    for (key, value) in part {
+                        if key == "text" {
+                            if let Either::Left(text) = &**value {
+                                text_parts.push(text.clone());
+                            }
+                        }
+                    }
+                }
+                if text_parts.is_empty() {
+                    None
+                } else {
+                    Some(text_parts.join(" "))
+                }
+            }
+        }
     }
 }
 
@@ -84,13 +143,15 @@ fn message_content_schema() -> Schema {
     Schema::OneOf(
         OneOfBuilder::new()
             .item(Schema::Object(
-                ObjectBuilder::new().schema_type(SchemaType::String).build(),
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(Type::String))
+                    .build(),
             ))
             .item(Schema::Array(
                 ArrayBuilder::new()
                     .items(RefOr::T(Schema::Object(
                         ObjectBuilder::new()
-                            .schema_type(SchemaType::Object)
+                            .schema_type(SchemaType::Type(Type::Object))
                             .additional_properties(Some(RefOr::Ref(
                                 utoipa::openapi::Ref::from_schema_name("MessageInnerContent"),
                             )))
@@ -255,37 +316,51 @@ pub enum Grammar {
 }
 
 // Implement ToSchema manually to handle `LlguidanceGrammar`
-impl utoipa::ToSchema<'_> for Grammar {
-    fn schema() -> (&'static str, RefOr<Schema>) {
-        (
-            "Grammar",
-            RefOr::T(Schema::OneOf(
-                OneOfBuilder::new()
-                    .item(create_grammar_variant_schema(
-                        "regex",
-                        Schema::Object(
-                            ObjectBuilder::new().schema_type(SchemaType::String).build(),
-                        ),
-                    ))
-                    .item(create_grammar_variant_schema(
-                        "json_schema",
-                        Schema::Object(
-                            ObjectBuilder::new().schema_type(SchemaType::Object).build(),
-                        ),
-                    ))
-                    .item(create_grammar_variant_schema(
-                        "llguidance",
-                        llguidance_schema(),
-                    ))
-                    .item(create_grammar_variant_schema(
-                        "lark",
-                        Schema::Object(
-                            ObjectBuilder::new().schema_type(SchemaType::String).build(),
-                        ),
-                    ))
-                    .build(),
-            )),
-        )
+impl PartialSchema for Grammar {
+    fn schema() -> RefOr<Schema> {
+        RefOr::T(Schema::OneOf(
+            OneOfBuilder::new()
+                .item(create_grammar_variant_schema(
+                    "regex",
+                    Schema::Object(
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::Type(Type::String))
+                            .build(),
+                    ),
+                ))
+                .item(create_grammar_variant_schema(
+                    "json_schema",
+                    Schema::Object(
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::Type(Type::Object))
+                            .build(),
+                    ),
+                ))
+                .item(create_grammar_variant_schema(
+                    "llguidance",
+                    llguidance_schema(),
+                ))
+                .item(create_grammar_variant_schema(
+                    "lark",
+                    Schema::Object(
+                        ObjectBuilder::new()
+                            .schema_type(SchemaType::Type(Type::String))
+                            .build(),
+                    ),
+                ))
+                .build(),
+        ))
+    }
+}
+
+impl ToSchema for Grammar {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        schemas.push((Grammar::name().into(), Grammar::schema()));
     }
 }
 
@@ -293,12 +368,12 @@ impl utoipa::ToSchema<'_> for Grammar {
 fn create_grammar_variant_schema(type_value: &str, value_schema: Schema) -> Schema {
     Schema::Object(
         ObjectBuilder::new()
-            .schema_type(SchemaType::Object)
+            .schema_type(SchemaType::Type(Type::Object))
             .property(
                 "type",
                 RefOr::T(Schema::Object(
                     ObjectBuilder::new()
-                        .schema_type(SchemaType::String)
+                        .schema_type(SchemaType::Type(Type::String))
                         .enum_values(Some(vec![serde_json::Value::String(
                             type_value.to_string(),
                         )]))
@@ -316,13 +391,12 @@ fn create_grammar_variant_schema(type_value: &str, value_schema: Schema) -> Sche
 fn llguidance_schema() -> Schema {
     let grammar_with_lexer_schema = Schema::Object(
         ObjectBuilder::new()
-            .schema_type(SchemaType::Object)
+            .schema_type(SchemaType::Type(Type::Object))
             .property(
                 "name",
                 RefOr::T(Schema::Object(
                     ObjectBuilder::new()
-                        .schema_type(SchemaType::String)
-                        .nullable(true)
+                        .schema_type(SchemaType::from_iter([Type::String, Type::Null]))
                         .description(Some(
                             "The name of this grammar, can be used in GenGrammar nodes",
                         ))
@@ -333,8 +407,7 @@ fn llguidance_schema() -> Schema {
                 "json_schema",
                 RefOr::T(Schema::Object(
                     ObjectBuilder::new()
-                        .schema_type(SchemaType::Object)
-                        .nullable(true)
+                        .schema_type(SchemaType::from_iter([Type::Object, Type::Null]))
                         .description(Some("The JSON schema that the grammar should generate"))
                         .build(),
                 )),
@@ -343,8 +416,7 @@ fn llguidance_schema() -> Schema {
                 "lark_grammar",
                 RefOr::T(Schema::Object(
                     ObjectBuilder::new()
-                        .schema_type(SchemaType::String)
-                        .nullable(true)
+                        .schema_type(SchemaType::from_iter([Type::String, Type::Null]))
                         .description(Some("The Lark grammar that the grammar should generate"))
                         .build(),
                 )),
@@ -355,7 +427,7 @@ fn llguidance_schema() -> Schema {
 
     Schema::Object(
         ObjectBuilder::new()
-            .schema_type(SchemaType::Object)
+            .schema_type(SchemaType::Type(Type::Object))
             .property(
                 "grammars",
                 RefOr::T(Schema::Array(
@@ -369,8 +441,7 @@ fn llguidance_schema() -> Schema {
                 "max_tokens",
                 RefOr::T(Schema::Object(
                     ObjectBuilder::new()
-                        .schema_type(SchemaType::Integer)
-                        .nullable(true)
+                        .schema_type(SchemaType::from_iter([Type::Integer, Type::Null]))
                         .description(Some("Maximum number of tokens to generate"))
                         .build(),
                 )),
@@ -481,7 +552,9 @@ fn messages_schema() -> Schema {
                     .build(),
             ))
             .item(Schema::Object(
-                ObjectBuilder::new().schema_type(SchemaType::String).build(),
+                ObjectBuilder::new()
+                    .schema_type(SchemaType::Type(Type::String))
+                    .build(),
             ))
             .build(),
     )
@@ -494,6 +567,15 @@ pub struct ModelObject {
     pub object: &'static str,
     pub created: u64,
     pub owned_by: &'static str,
+    /// Whether tools are available through MCP or tool callbacks
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools_available: Option<bool>,
+    /// Number of tools available from MCP servers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tools_count: Option<usize>,
+    /// Number of connected MCP servers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_servers_connected: Option<usize>,
 }
 
 /// Collection of available models
@@ -526,6 +608,7 @@ pub struct CompletionRequest {
     #[schema(example = json!(Option::None::<usize>))]
     pub logprobs: Option<usize>,
     #[schema(example = 16)]
+    #[serde(alias = "max_completion_tokens")]
     pub max_tokens: Option<usize>,
     #[serde(rename = "n")]
     #[serde(default = "default_1usize")]
@@ -643,4 +726,252 @@ pub struct SpeechGenerationRequest {
     /// The desired audio format for the generated speech.
     #[schema(example = "mp3")]
     pub response_format: AudioResponseFormat,
+}
+
+/// Helper type for messages field in ResponsesCreateRequest
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ResponsesMessages {
+    Messages(Vec<Message>),
+    String(String),
+}
+
+impl ResponsesMessages {
+    pub fn into_either(self) -> Either<Vec<Message>, String> {
+        match self {
+            ResponsesMessages::Messages(msgs) => Either::Left(msgs),
+            ResponsesMessages::String(s) => Either::Right(s),
+        }
+    }
+}
+
+impl PartialSchema for ResponsesMessages {
+    fn schema() -> RefOr<Schema> {
+        RefOr::T(messages_schema())
+    }
+}
+
+impl ToSchema for ResponsesMessages {
+    fn schemas(
+        schemas: &mut Vec<(
+            String,
+            utoipa::openapi::RefOr<utoipa::openapi::schema::Schema>,
+        )>,
+    ) {
+        schemas.push((
+            ResponsesMessages::name().into(),
+            ResponsesMessages::schema(),
+        ));
+    }
+}
+
+/// Response creation request
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct ResponsesCreateRequest {
+    #[schema(example = "mistral")]
+    #[serde(default = "default_model")]
+    pub model: String,
+    pub input: ResponsesMessages,
+    #[schema(example = json!(Option::None::<String>))]
+    pub instructions: Option<String>,
+    #[schema(example = json!(Option::None::<Vec<String>>))]
+    pub modalities: Option<Vec<String>>,
+    #[schema(example = json!(Option::None::<String>))]
+    pub previous_response_id: Option<String>,
+    #[schema(example = json!(Option::None::<HashMap<u32, f32>>))]
+    pub logit_bias: Option<HashMap<u32, f32>>,
+    #[serde(default = "default_false")]
+    #[schema(example = false)]
+    pub logprobs: bool,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub top_logprobs: Option<usize>,
+    #[schema(example = 256)]
+    #[serde(alias = "max_completion_tokens", alias = "max_output_tokens")]
+    pub max_tokens: Option<usize>,
+    #[serde(rename = "n")]
+    #[serde(default = "default_1usize")]
+    #[schema(example = 1)]
+    pub n_choices: usize,
+    #[schema(example = json!(Option::None::<f32>))]
+    pub presence_penalty: Option<f32>,
+    #[schema(example = json!(Option::None::<f32>))]
+    pub frequency_penalty: Option<f32>,
+    #[serde(rename = "stop")]
+    #[schema(example = json!(Option::None::<StopTokens>))]
+    pub stop_seqs: Option<StopTokens>,
+    #[schema(example = 0.7)]
+    pub temperature: Option<f64>,
+    #[schema(example = json!(Option::None::<f64>))]
+    pub top_p: Option<f64>,
+    #[schema(example = false)]
+    pub stream: Option<bool>,
+    #[schema(example = json!(Option::None::<Vec<Tool>>))]
+    pub tools: Option<Vec<Tool>>,
+    #[schema(example = json!(Option::None::<ToolChoice>))]
+    pub tool_choice: Option<ToolChoice>,
+    #[schema(example = json!(Option::None::<ResponseFormat>))]
+    pub response_format: Option<ResponseFormat>,
+    #[schema(example = json!(Option::None::<WebSearchOptions>))]
+    pub web_search_options: Option<WebSearchOptions>,
+    #[schema(example = json!(Option::None::<Value>))]
+    pub metadata: Option<Value>,
+    #[schema(example = json!(Option::None::<bool>))]
+    pub output_token_details: Option<bool>,
+    #[schema(example = json!(Option::None::<bool>))]
+    pub parallel_tool_calls: Option<bool>,
+    #[schema(example = json!(Option::None::<bool>))]
+    pub store: Option<bool>,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub max_tool_calls: Option<usize>,
+    #[schema(example = json!(Option::None::<bool>))]
+    pub reasoning_enabled: Option<bool>,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub reasoning_max_tokens: Option<usize>,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub reasoning_top_logprobs: Option<usize>,
+    #[schema(example = json!(Option::None::<Vec<String>>))]
+    pub truncation: Option<HashMap<String, Value>>,
+
+    // mistral.rs additional
+    #[schema(example = json!(Option::None::<usize>))]
+    pub top_k: Option<usize>,
+    #[schema(example = json!(Option::None::<Grammar>))]
+    pub grammar: Option<Grammar>,
+    #[schema(example = json!(Option::None::<f64>))]
+    pub min_p: Option<f64>,
+    #[schema(example = json!(Option::None::<f32>))]
+    pub dry_multiplier: Option<f32>,
+    #[schema(example = json!(Option::None::<f32>))]
+    pub dry_base: Option<f32>,
+    #[schema(example = json!(Option::None::<usize>))]
+    pub dry_allowed_length: Option<usize>,
+    #[schema(example = json!(Option::None::<String>))]
+    pub dry_sequence_breakers: Option<Vec<String>>,
+    #[schema(example = json!(Option::None::<bool>))]
+    pub enable_thinking: Option<bool>,
+}
+
+/// Response object
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesObject {
+    pub id: String,
+    pub object: &'static str,
+    pub created_at: f64,
+    pub model: String,
+    pub status: String,
+    pub output: Vec<ResponsesOutput>,
+    pub output_text: Option<String>,
+    pub usage: Option<ResponsesUsage>,
+    pub error: Option<ResponsesError>,
+    pub metadata: Option<Value>,
+    pub instructions: Option<String>,
+    pub incomplete_details: Option<ResponsesIncompleteDetails>,
+}
+
+/// Response usage information
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesUsage {
+    pub input_tokens: usize,
+    pub output_tokens: usize,
+    pub total_tokens: usize,
+    pub input_tokens_details: Option<ResponsesInputTokensDetails>,
+    pub output_tokens_details: Option<ResponsesOutputTokensDetails>,
+}
+
+/// Input tokens details
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesInputTokensDetails {
+    pub audio_tokens: Option<usize>,
+    pub cached_tokens: Option<usize>,
+    pub image_tokens: Option<usize>,
+    pub text_tokens: Option<usize>,
+}
+
+/// Output tokens details
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesOutputTokensDetails {
+    pub audio_tokens: Option<usize>,
+    pub text_tokens: Option<usize>,
+    pub reasoning_tokens: Option<usize>,
+}
+
+/// Response error
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesError {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
+}
+
+/// Incomplete details for incomplete responses
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesIncompleteDetails {
+    pub reason: String,
+}
+
+/// Response output item
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesOutput {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub output_type: String,
+    pub role: String,
+    pub status: Option<String>,
+    pub content: Vec<ResponsesContent>,
+}
+
+/// Response content item
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    pub text: Option<String>,
+    pub annotations: Option<Vec<ResponsesAnnotation>>,
+}
+
+/// Response annotation
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesAnnotation {
+    #[serde(rename = "type")]
+    pub annotation_type: String,
+    pub text: String,
+    pub start_index: usize,
+    pub end_index: usize,
+}
+
+/// Response streaming chunk
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesChunk {
+    pub id: String,
+    pub object: &'static str,
+    pub created_at: f64,
+    pub model: String,
+    pub chunk_type: String,
+    pub delta: Option<ResponsesDelta>,
+    pub usage: Option<ResponsesUsage>,
+    pub metadata: Option<Value>,
+}
+
+/// Response delta for streaming
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesDelta {
+    pub output: Option<Vec<ResponsesDeltaOutput>>,
+    pub status: Option<String>,
+}
+
+/// Response delta output item
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesDeltaOutput {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub output_type: String,
+    pub content: Option<Vec<ResponsesDeltaContent>>,
+}
+
+/// Response delta content item
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ResponsesDeltaContent {
+    #[serde(rename = "type")]
+    pub content_type: String,
+    pub text: Option<String>,
 }

@@ -11,9 +11,9 @@ maturin build -o wheels-cpu -m mistralrs-pyo3/Cargo.toml --interpreter python3.1
 
 # Metal
 
-maturin build -o wheels-metal -m mistralrs-pyo3/Cargo.toml --interpreter python3.10 --features metal
-maturin build -o wheels-metal -m mistralrs-pyo3/Cargo.toml --interpreter python3.11 --features metal
-maturin build -o wheels-metal -m mistralrs-pyo3/Cargo.toml --interpreter python3.12 --features metal
+MACOSX_DEPLOYMENT_TARGET=15.0 maturin build -o wheels-metal -m mistralrs-pyo3/Cargo.toml --interpreter python3.10 --features metal
+MACOSX_DEPLOYMENT_TARGET=15.0 maturin build -o wheels-metal -m mistralrs-pyo3/Cargo.toml --interpreter python3.11 --features metal
+MACOSX_DEPLOYMENT_TARGET=15.0 maturin build -o wheels-metal -m mistralrs-pyo3/Cargo.toml --interpreter python3.12 --features metal
 
 # Accelerate
 
@@ -24,9 +24,9 @@ maturin build -o wheels-accelerate -m mistralrs-pyo3/Cargo.toml --interpreter py
 # WINDOWS: x86_64 Manylinux, Windows
 
 docker build -t wheelmaker:latest -f Dockerfile.manylinux .
-docker run --rm -v .:/io wheelmaker build --release -o wheels-cpu -m mistralrs-pyo3/Cargo.toml --interpreter python3.10
-docker run --rm -v .:/io wheelmaker build --release -o wheels-cpu -m mistralrs-pyo3/Cargo.toml --interpreter python3.11
-docker run --rm -v .:/io wheelmaker build --release -o wheels-cpu -m mistralrs-pyo3/Cargo.toml --interpreter python3.12
+docker run -e RUSTFLAGS="-C target-cpu=generic" --rm -v .:/io wheelmaker build --release -o wheels-cpu -m mistralrs-pyo3/Cargo.toml --interpreter python3.10
+docker run -e RUSTFLAGS="-C target-cpu=generic" --rm -v .:/io wheelmaker build --release -o wheels-cpu -m mistralrs-pyo3/Cargo.toml --interpreter python3.11
+docker run -e RUSTFLAGS="-C target-cpu=generic" --rm -v .:/io wheelmaker build --release -o wheels-cpu -m mistralrs-pyo3/Cargo.toml --interpreter python3.12
 
 maturin build -o wheels-cpu -m mistralrs-pyo3/Cargo.toml --interpreter python3.10
 maturin build -o wheels-cpu -m mistralrs-pyo3/Cargo.toml --interpreter python3.11

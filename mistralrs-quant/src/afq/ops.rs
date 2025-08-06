@@ -294,7 +294,6 @@ pub(crate) fn afq_mm_op(
 
         let device = w_s.device();
 
-        assert_eq!(x.layout().start_offset(), 0);
         assert_eq!(w.layout().start_offset(), 0);
         assert_eq!(scales.layout().start_offset(), 0);
         assert_eq!(biases.layout().start_offset(), 0);
@@ -348,6 +347,7 @@ pub(crate) fn afq_mm_op(
                 &crate::metal_kernels::Kernels::new(),
                 scales.dtype(),
                 x_s.buffer(),
+                x.layout().start_offset() * x.dtype().size_in_bytes(),
                 x.dims(),
                 x.stride(),
                 w_s.buffer(),
@@ -385,6 +385,7 @@ pub(crate) fn afq_mm_op(
                 &crate::metal_kernels::Kernels::new(),
                 scales.dtype(),
                 x_s.buffer(),
+                x.layout().start_offset() * x.dtype().size_in_bytes(),
                 x.dims(),
                 x.stride(),
                 w_s.buffer(),
@@ -454,15 +455,72 @@ mod metal_tests {
 
         let (w_q, scales, biases) = afq_quantize_op(&xs, group_size, bits)?;
 
-        // println!("w_q = {w_q}");
-        // println!("scales = {scales}");
-        // println!("biases = {biases}");
+        println!("w_q shape = {:?}, dtype = {:?}", w_q.shape(), w_q.dtype());
+        println!(
+            "scales shape = {:?}, dtype = {:?}",
+            scales.shape(),
+            scales.dtype()
+        );
+        println!(
+            "biases shape = {:?}, dtype = {:?}",
+            biases.shape(),
+            biases.dtype()
+        );
+        println!(
+            "First few w_q values: {:?}",
+            w_q.flatten_all()?
+                .to_vec1::<u32>()?
+                .iter()
+                .take(10)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "First few scales: {:?}",
+            scales
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .take(5)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "First few biases: {:?}",
+            biases
+                .flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .take(5)
+                .collect::<Vec<_>>()
+        );
 
         let ys = afq_dequantize_op(&w_q, &scales, &biases, group_size, bits)?;
 
-        // println!("xs = {xs}");
-        // println!("ys = {ys}");
-        // println!("delta = {}", (xs - ys)?);
+        println!(
+            "xs min/max: {:?}/{:?}",
+            xs.min(D::Minus1)?.min_all()?.to_scalar::<f32>()?,
+            xs.max(D::Minus1)?.max_all()?.to_scalar::<f32>()?
+        );
+        println!(
+            "ys min/max: {:?}/{:?}",
+            ys.min(D::Minus1)?.min_all()?.to_scalar::<f32>()?,
+            ys.max(D::Minus1)?.max_all()?.to_scalar::<f32>()?
+        );
+        println!(
+            "First few xs values: {:?}",
+            xs.flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .take(5)
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "First few ys values: {:?}",
+            ys.flatten_all()?
+                .to_vec1::<f32>()?
+                .iter()
+                .take(5)
+                .collect::<Vec<_>>()
+        );
 
         let rmse = (xs - ys)?
             .sqr()?
@@ -525,6 +583,10 @@ mod cpu_backend {
         group_size: usize,
         bits: usize,
     ) -> Result<(Tensor, Tensor, Tensor)> {
+        if bits == 40 {
+            // mxfp4 is not supported in CPU backend
+            candle_core::bail!("mxfp4 quantization is only supported on Metal backend");
+        }
         let device = w.device().clone();
         let levels = ((1u32 << bits) - 1) as f32;
 
@@ -618,6 +680,10 @@ mod cpu_backend {
         group_size: usize,
         _bits: usize,
     ) -> Result<Tensor> {
+        if _bits == 40 {
+            // mxfp4 is not supported in CPU backend
+            candle_core::bail!("mxfp4 dequantization is only supported on Metal backend");
+        }
         let device = w_q.device().clone();
         let codes = w_q.flatten_all()?.to_vec1::<u32>()?;
         let sc = scales
@@ -683,6 +749,10 @@ mod cpu_backend {
         bits: usize,
         transpose: bool,
     ) -> Result<Tensor> {
+        if bits == 40 {
+            // mxfp4 is not supported in CPU backend
+            candle_core::bail!("mxfp4 matmul is only supported on Metal backend");
+        }
         let w_f32 = afq_dequantize_op(w, scales, biases, group_size, bits)?.to_dtype(x.dtype())?;
         if transpose {
             x.broadcast_matmul(&w_f32.t()?)
