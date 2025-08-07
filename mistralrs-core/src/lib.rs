@@ -130,6 +130,8 @@ pub use llguidance;
 /// `true` if `MISTRALRS_DEBUG=1`
 pub(crate) static DEBUG: AtomicBool = AtomicBool::new(false);
 pub static GLOBAL_HF_CACHE: OnceLock<Cache> = OnceLock::new();
+// Tronai Patch: add endpoint here
+pub static GLOBAL_HF_ENDPOINT: OnceLock<String> = OnceLock::new();
 
 /// Configuration for creating an engine instance
 #[derive(Clone)]
