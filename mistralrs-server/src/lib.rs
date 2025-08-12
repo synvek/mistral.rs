@@ -199,6 +199,9 @@ pub struct ModelInfo {
 
     /// Token source
     pub token_source: Option<String>,
+
+    ///CPU
+    pub cpu: bool,
 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
