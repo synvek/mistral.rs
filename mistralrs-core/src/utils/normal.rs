@@ -5,6 +5,8 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use serde::Deserialize;
 use tracing::info;
+use std::os::windows::process::CommandExt; // 注意 Windows 特有特性
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Copy, Default, Debug, Deserialize, PartialEq)]
 #[cfg_attr(feature = "pyo3_macros", pyo3::pyclass(eq, eq_int))]
@@ -74,6 +76,8 @@ fn get_dtypes() -> Vec<DType> {
     const MIN_F16_CC: usize = 530;
 
     let raw_out = Command::new("nvidia-smi")
+        //Tronai patch: Fix unexpected window for non-console application in windows
+        .creation_flags(CREATE_NO_WINDOW )
         .arg("--query-gpu=compute_cap")
         .arg("--format=csv")
         .output()
