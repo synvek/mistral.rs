@@ -119,7 +119,7 @@ macro_rules! get_paths {
         let api = {
             use $crate::GLOBAL_HF_CACHE;
             let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
-            // Tronai patch: activate endpoint
+            // Synvek patch: activate endpoint
             use $crate::GLOBAL_HF_ENDPOINT;
             let endpoint = GLOBAL_HF_ENDPOINT.get().cloned().unwrap_or_default();
             let mut api = ApiBuilder::from_cache(cache)

@@ -76,7 +76,7 @@ fn get_dtypes() -> Vec<DType> {
     const MIN_F16_CC: usize = 530;
 
     let raw_out = Command::new("nvidia-smi")
-        //Tronai patch: Fix unexpected window for non-console application in windows
+        //Synvek patch: Fix unexpected window for non-console application in windows
         .creation_flags(CREATE_NO_WINDOW )
         .arg("--query-gpu=compute_cap")
         .arg("--format=csv")

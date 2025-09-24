@@ -85,7 +85,7 @@ impl Loader for DiffusionLoader {
         paged_attn_config: Option<PagedAttentionConfig>,
     ) -> Result<Arc<Mutex<dyn Pipeline + Send + Sync>>> {
         let paths: anyhow::Result<Box<dyn ModelPaths>> = {
-            // Tronai patch: activate cache & endpoint
+            // Synvek patch: activate cache & endpoint
             use crate::GLOBAL_HF_CACHE;
             use crate::GLOBAL_HF_ENDPOINT;
             let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();

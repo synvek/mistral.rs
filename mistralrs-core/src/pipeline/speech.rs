@@ -166,7 +166,7 @@ impl Loader for SpeechLoader {
             // Main weights first, DAC is the final one.
             let mut weights = Vec::new();
 
-            // Tronai patch: activate cache & endpoint
+            // Synvek patch: activate cache & endpoint
             use crate::GLOBAL_HF_CACHE;
             let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
             // Main model
@@ -191,7 +191,7 @@ impl Loader for SpeechLoader {
 
             // DAC model
             {
-                // Tronai patch: activate cache & endpoint
+                // Synvek patch: activate cache & endpoint
                 use crate::GLOBAL_HF_CACHE;
                 let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();
                 let api = ApiBuilder::from_cache(cache)

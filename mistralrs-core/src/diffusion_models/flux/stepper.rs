@@ -172,7 +172,7 @@ impl FluxStepper {
         silent: bool,
         offloaded: bool,
     ) -> anyhow::Result<Self> {
-        // Tronai patch: activate cache & endpoint
+        // Synvek patch: activate cache & endpoint
         use crate::GLOBAL_HF_CACHE;
         use crate::GLOBAL_HF_ENDPOINT;
         let cache = GLOBAL_HF_CACHE.get().cloned().unwrap_or_default();

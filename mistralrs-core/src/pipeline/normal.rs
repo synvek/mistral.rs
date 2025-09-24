@@ -139,7 +139,7 @@ impl NormalLoaderBuilder {
         no_kv_cache: bool,
         jinja_explicit: Option<String>,
     ) -> Self {
-        // Tronai patch: activate cache path here
+        // Synvek patch: activate cache path here
         Self {
             config: config.clone(),
             xlora_model_id: None,
