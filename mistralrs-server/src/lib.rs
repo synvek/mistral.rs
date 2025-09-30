@@ -205,6 +205,8 @@ pub struct ModelInfo {
 
     /// Offloaded
     pub offloaded: bool,
+
+    pub backend: String,
 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
