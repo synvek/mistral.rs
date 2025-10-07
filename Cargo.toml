@@ -45,7 +45,10 @@ either = { version = "1.15.0", features = ["serde"] }
 accelerate-src = { version = "0.3.2" }
 intel-mkl-src = { version = "0.8.1", features = ["mkl-static-lp64-iomp"] }
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "time"] }
+tracing-log = "0.2.0"
+tracing-appender = "0.2"
+tracing-chrome = "0.7.2"
 futures = "0.3"
 clap = { version = "4.5.39", features = ["derive", "wrap_help"] }
 pyo3 = { version = "0.25.0", features = ["full", "extension-module", "either"] }
@@ -171,6 +174,8 @@ rustfft = "6.3.0"
 hound = "3.5.1"
 apodize = "1.0.0"
 statrs = "0.18.0"
+
+time = { version = "0.3", features = ["macros", "parsing"] }
 
 mistralrs-core = { path = "mistralrs-core" }
 mistralrs-paged-attn = { path = "mistralrs-paged-attn" }

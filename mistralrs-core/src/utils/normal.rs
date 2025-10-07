@@ -5,7 +5,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use serde::Deserialize;
 use tracing::info;
-use std::os::windows::process::CommandExt; // 注意 Windows 特有特性
+use std::os::windows::process::CommandExt;
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Copy, Default, Debug, Deserialize, PartialEq)]

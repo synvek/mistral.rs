@@ -1,29 +1,48 @@
-use std::collections::HashMap;
-use std::env;
-use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
 use anyhow::Result;
 use clap::Parser;
 use hf_hub::Cache;
-use tokio::time::sleep;
-use mistralrs_core::{initialize_logging, McpClientConfig, ModelSelected, PagedCacheType, TokenSource, GLOBAL_HF_CACHE, GLOBAL_HF_ENDPOINT};
-use tracing::{error, info};
-use std::future::Future;
-use rust_mcp_sdk::schema::LATEST_PROTOCOL_VERSION;
+use mistralrs_core::{
+    McpClientConfig, ModelSelected, PagedCacheType, TokenSource, GLOBAL_HF_CACHE,
+    GLOBAL_HF_ENDPOINT,
+};
 use mistralrs_server_core::{
     mistralrs_for_server_builder::{defaults, get_bert_model, MistralRsForServerBuilder},
     mistralrs_server_router_builder::MistralRsServerRouterBuilder,
 };
+use rust_mcp_sdk::schema::LATEST_PROTOCOL_VERSION;
+use std::collections::HashMap;
+use std::env;
+use std::ffi::{c_char, c_int, CStr, CString, OsString};
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+use reqwest::{header, Client};
+use serde::{Deserialize, Serialize};
+use time::macros::format_description;
+use tokio::time::sleep;
+use tracing::{error, info};
 
 mod interactive_mode;
 mod mcp_server;
 
 use interactive_mode::interactive_mode;
-use mistralrs_server_core::mistralrs_for_server_builder::{configure_paged_attn_from_flags, ModelConfig};
-use tokio::join;
 
+static LOGGER: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+
+use mistralrs_server_core::mistralrs_for_server_builder::{
+    configure_paged_attn_from_flags, ModelConfig,
+};
+use tokio::join;
+use tokio::runtime::Runtime;
+use tracing_appender::rolling::Rotation;
+use tracing_appender::{non_blocking, rolling};
+use tracing_subscriber::fmt::format;
+use tracing_subscriber::fmt::time::OffsetTime;
+use tracing_subscriber::fmt::writer::MakeWriterExt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::{fmt, Registry};
 
 fn parse_cache_type(s: &str) -> Result<PagedCacheType, String> {
     s.parse()
@@ -171,7 +190,7 @@ struct Args {
     mcp_config: Option<String>,
 }
 
-#[derive(Debug, Clone, )]
+#[derive(Debug, Clone)]
 pub struct ModelInfo {
     /// Model Name： Local Model Identifier
     pub model_name: String,
@@ -208,6 +227,33 @@ pub struct ModelInfo {
 
     pub backend: String,
 }
+#[derive(Debug, Deserialize, Serialize)]
+pub struct HeartTickRequest {
+    pub task_id: String,
+}
+
+/// Response for Start Model Server
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HeartTickResponse {
+
+    /// Status
+    pub success: bool,
+
+    /// Code
+    pub code: String,
+
+    /// Message
+    pub message: String,
+
+    /// Data
+    pub data: Option<String>,
+
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct ServerConfig {
+    pub main_process_port: String
+}
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
     s.parse()
@@ -216,7 +262,7 @@ fn parse_token_source(s: &str) -> Result<TokenSource, String> {
 type NotificationCallback = fn(String) -> ();
 
 static GLOBAL_LOCKS: OnceLock<Arc<Mutex<HashMap<String, ModelInfo>>>> = OnceLock::new();
-
+static GLOBAL_CONFIG: OnceLock<Arc<Mutex<ServerConfig>>> = OnceLock::new();
 
 async fn shutdown_signal(task_id: String) {
     loop {
@@ -234,19 +280,27 @@ fn init_map() -> Arc<Mutex<HashMap<String, ModelInfo>>> {
     Arc::new(Mutex::new(HashMap::new()))
 }
 
-fn insert_lock(key: String, value:ModelInfo) {
+fn insert_lock(key: String, value: ModelInfo) {
     let map_ref = Arc::clone(GLOBAL_LOCKS.get().unwrap());
     let mut map = map_ref.lock().unwrap();
     map.insert(key, value);
 }
 
-pub fn initialize_server(model_dir: PathBuf, endpoint: String) {
+fn init_server_config(server_config: ServerConfig) -> Arc<Mutex<ServerConfig>> {
+    Arc::new(Mutex::new(server_config))
+}
+
+pub fn initialize_server(model_dir: PathBuf, endpoint: String, port: String) {
+    let server_config = ServerConfig {
+        main_process_port: port,
+    };
     GLOBAL_LOCKS.get_or_init(|| init_map());
     //let path = std::path::PathBuf::from("C:/source/works/huan/engine/models");
     let cache = Cache::new(model_dir);
     //let end_point = "https://hf-mirror.com".to_string();
     GLOBAL_HF_CACHE.get_or_init(|| cache.clone());
     GLOBAL_HF_ENDPOINT.get_or_init(|| endpoint.clone());
+    GLOBAL_CONFIG.get_or_init(||init_server_config(server_config));
     println!("Check cache path = {}", cache.path().display().to_string());
     println!("Check end point = {}", endpoint.to_string());
 }
@@ -257,7 +311,149 @@ pub fn stop_server(task_id: String) {
     map.remove(&task_id);
 }
 
-pub fn get_servers()->Vec<ModelInfo> {
+// 错误码定义
+pub const SUCCESS: c_int = 0;
+pub const ERROR_NULL_PTR: c_int = -1;
+pub const ERROR_UTF8_CONVERSION: c_int = -2;
+pub const ERROR_SERVER_START: c_int = -3;
+
+#[no_mangle]
+pub extern "C" fn stop_backend_server(task_id: *const c_char) -> c_int {
+    if task_id.is_null() {
+        return ERROR_NULL_PTR;
+    }
+    let task_id_rust = unsafe {
+        match CStr::from_ptr(task_id).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return ERROR_UTF8_CONVERSION,
+        }
+    };
+    let map_ref = Arc::clone(GLOBAL_LOCKS.get().unwrap());
+    let mut map = map_ref.lock().unwrap();
+    map.remove(&task_id_rust);
+    SUCCESS
+}
+
+#[no_mangle]
+pub extern "C" fn init_backend_server(model_dir: *const c_char, endpoint: *const c_char, port: *const c_char) -> c_int {
+    if model_dir.is_null() || endpoint.is_null() {
+        return ERROR_NULL_PTR;
+    }
+    let model_dir = Path::new(unsafe { CStr::from_ptr(model_dir).to_str().unwrap() });
+    let endpoint = unsafe { CStr::from_ptr(endpoint).to_str().unwrap() };
+    let port = unsafe { CStr::from_ptr(port).to_str().unwrap() };
+    initialize_logging();
+    initialize_server(model_dir.to_owned(), endpoint.to_owned(), port.to_owned());
+    SUCCESS
+}
+
+#[no_mangle]
+pub fn start_backend_server(
+    task_id: *const c_char,
+    run_args: *const c_char,
+) -> c_int {
+    if task_id.is_null() || run_args.is_null() {
+        return ERROR_NULL_PTR;
+    }
+    let task_id_rust = unsafe {
+        match CStr::from_ptr(task_id).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return ERROR_UTF8_CONVERSION,
+        }
+    };
+    let run_args_rust_raw = unsafe {
+        match CStr::from_ptr(run_args).to_str() {
+            Ok(s) => s.to_string(),
+            Err(_) => return ERROR_UTF8_CONVERSION,
+        }
+    };
+    let run_args_rust: Vec<String> =
+        serde_json::from_str(run_args_rust_raw.as_str()).unwrap_or_default();
+    let rt = Runtime::new().unwrap();
+    let result = rt.block_on(async {
+        tokio::task::spawn_blocking(move || {
+            let rt_blocking = Runtime::new().unwrap();
+            rt_blocking.block_on(start_backend_server_internally(task_id_rust, run_args_rust))
+        })
+        .await
+        .unwrap()
+    });
+    if result.is_err() {
+        tracing::error!("Error starting backend server: {:?}", result);
+        return ERROR_SERVER_START;
+    }
+    SUCCESS
+}
+
+pub fn initialize_logging() {
+    LOGGER.get_or_init(|| {
+        let console_offset = time::UtcOffset::from_hms(8, 0, 0).unwrap();
+        let console_timer = OffsetTime::new(
+            console_offset,
+            format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
+        );
+        let console_layer = fmt::layer()
+            .with_timer(console_timer)
+            .with_writer(std::io::stdout.with_max_level(tracing::Level::INFO));
+
+        // 2. 配置文件输出 + 按大小分割
+        let file_appender = rolling::Builder::new()
+            .rotation(Rotation::DAILY)
+            .max_log_files(15)
+            .filename_prefix("synvek")
+            .filename_suffix("log")
+            .build("./logs")
+            .expect("Failed to create file appender");
+
+        let file_offset = time::UtcOffset::from_hms(8, 0, 0).unwrap();
+        let file_timer = OffsetTime::new(
+            file_offset,
+            format_description!("[year]-[month]-[day] [hour]:[minute]:[second]"),
+        );
+
+        let (file_writer, _guard) = non_blocking(file_appender);
+        let file_layer = fmt::layer()
+            .with_ansi(false)
+            .event_format(format().compact())
+            .with_timer(file_timer)
+            .with_writer(file_writer.with_max_level(tracing::Level::INFO));
+
+        let subscriber = Registry::default().with(console_layer).with(file_layer);
+
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+        Box::leak(Box::new(_guard));
+    });
+}
+
+async fn start_backend_server_internally(
+    task_id: String,
+    run_args: Vec<String>,
+) -> anyhow::Result<()> {
+    let run_args: Vec<OsString> = run_args.into_iter().map(OsString::from).collect();
+    let model_info = ModelInfo {
+        model_name: "".to_string(),
+        task_id: task_id.clone(),
+        port: "".to_string(),
+        started: false,
+        isq: None,
+        model_id: "".to_string(),
+        model_type: "".to_string(),
+        path: "".to_string(),
+        token_source: None,
+        cpu: false,
+        offloaded: false,
+        backend: "".to_string(),
+    };
+    tracing::info!("Starting backend server with args: {:?}", run_args);
+    let result = start_server(task_id, run_args, model_info, notify_main_process).await;
+    let notification = result.await;
+    if notification.is_err() {
+        Err(notification.unwrap_err())
+    } else {
+        Ok(())
+    }
+}
+pub fn get_servers() -> Vec<ModelInfo> {
     let map_ref = Arc::clone(GLOBAL_LOCKS.get().unwrap());
     let mut map = map_ref.lock().unwrap();
     map.values().cloned().collect::<Vec<_>>()
@@ -269,6 +465,59 @@ pub fn get_server(task_id: String) -> Option<ModelInfo> {
     map.get(&task_id).cloned()
 }
 
+pub fn get_main_process_port() -> String {
+    let server_config = Arc::clone(GLOBAL_CONFIG.get().unwrap());
+    let server_config = server_config.lock().unwrap();
+    server_config.main_process_port.clone()
+}
+async fn notify_main_process(task_id: String) -> anyhow::Result<()> {
+    let port = get_main_process_port();
+    let client = Client::builder().timeout(Duration::from_secs(5)).build()?;
+    let request_data = HeartTickRequest {
+        task_id: task_id.clone(),
+    };
+
+    let mut main_process_address = "http://127.0.0.1:".to_string();
+    main_process_address.push_str(port.as_str());
+    main_process_address.push_str("/api/v1/process/heart-tick");
+    tracing::info!("Notify on: {}", main_process_address.clone());
+    let response = client
+        .post(main_process_address.clone())
+        .json(&request_data)
+        .header(header::CONTENT_TYPE, "application/json")
+        .send()
+        .await;
+    tracing::info!("Notify finished: {}", main_process_address.clone());
+
+    if response.is_ok() {
+        let response = response?;
+        if response.status().is_success() {
+            let response_data = response.json::<HeartTickResponse>().await;
+            if response_data.is_ok() {
+                tracing::info!(
+                    "Succeed to notify process with task_id: {} and response: {:?}",
+                    task_id,
+                    response_data
+                );
+            } else {
+                tracing::error!(
+                    "Failed to notify process with task_id: {} and reason: {}",
+                    task_id,
+                    response_data.unwrap_err()
+                );
+            }
+        } else {
+            tracing::info!("Failed to notify process with response: {:?}", response);
+        }
+    } else {
+        tracing::error!(
+            "Failed to notify process with task_id: {} and reason: {}",
+            task_id,
+            response.unwrap_err()
+        );
+    }
+    Ok(())
+}
 
 /// Load MCP configuration from file path or environment variable
 fn load_mcp_config(mcp_config_path: Option<&str>) -> Result<Option<McpClientConfig>> {
@@ -428,24 +677,29 @@ fn load_multi_model_config(config_path: &str) -> Result<Vec<ModelConfig>> {
     Ok(configs)
 }
 
-//#[tokio::main]
-pub async fn start_server<F, Fut>(task_id: String, run_args: Vec<OsString>, model_info: ModelInfo, callback: F) -> impl Future<Output = Result<()>>
+pub async fn start_server<F, Fut>(
+    task_id: String,
+    run_args: Vec<OsString>,
+    model_info: ModelInfo,
+    callback: F,
+) -> impl Future<Output = Result<()>>
 where
     F: FnOnce(String) -> Fut,
-    Fut: Future<Output = Result<()>>, {
+    Fut: Future<Output = Result<()>>,
+{
     async move {
         // let mut env_args: Vec<_> = env::args_os().collect();
         // env_args.remove(1);
         // env_args.remove(1);
         // println!("{:?}", env_args);
         // let args = Args::parse_from(env_args.drain(..));
-        // println!("{:?}", run_args);
+        println!("Start backend server default with args={:?}", run_args);
         let args = Args::try_parse_from(run_args)?;
+        println!("Start backend server default with parser ={:?}", args);
         // println!("{:?}", args);
         //initialize_logging();
         info!("Starting server with signal {}...", task_id);
         insert_lock(task_id.clone(), model_info);
-
 
         // Load MCP configuration if provided
         let mcp_config = load_mcp_config(args.mcp_config.as_deref())?;
@@ -526,11 +780,9 @@ where
                 bert_model.is_some(),
                 args.enable_thinking.then_some(true),
             )
-                .await;
+            .await;
             return Ok(());
         }
-
-
 
         if !args.interactive_mode && args.port.is_none() && args.mcp_port.is_none() {
             anyhow::bail!("Interactive mode was not specified, so expected port to be specified. Perhaps you forgot `-i` or `--port` or `--mcp-port`?")
@@ -573,7 +825,6 @@ where
 
         tracing::info!("Model server is ready to bind port {}...", task_id);
 
-
         let oai_port = if let Some(port) = args.port {
             let ip = args
                 .serve_ip
@@ -591,7 +842,10 @@ where
             info!("OpenAI-compatible server listening on http://{ip}:{port}.");
 
             tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(task_id)).await {
+                if let Err(e) = axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown_signal(task_id))
+                    .await
+                {
                     eprintln!("OpenAI server error: {e}");
                 }
             })
@@ -600,7 +854,6 @@ where
         };
 
         let (_, _) = join!(oai_port, mcp_port);
-
 
         // // Needs to be after the .build call as that is where the daemon waits.
         // let setting_server = if !args.interactive_mode {
