@@ -226,6 +226,9 @@ pub struct ModelInfo {
     pub offloaded: bool,
 
     pub backend: String,
+
+    /// Acceleration
+    pub acceleration: String,
 }
 #[derive(Debug, Deserialize, Serialize)]
 pub struct HeartTickRequest {
@@ -400,7 +403,7 @@ pub fn initialize_logging() {
         let file_appender = rolling::Builder::new()
             .rotation(Rotation::DAILY)
             .max_log_files(15)
-            .filename_prefix("synvek")
+            .filename_prefix("synvek_backend_default")
             .filename_suffix("log")
             .build("./logs")
             .expect("Failed to create file appender");
@@ -443,6 +446,7 @@ async fn start_backend_server_internally(
         cpu: false,
         offloaded: false,
         backend: "".to_string(),
+        acceleration: "".to_string(),
     };
     tracing::info!("Starting backend server with args: {:?}", run_args);
     let result = start_server(task_id, run_args, model_info, notify_main_process).await;
