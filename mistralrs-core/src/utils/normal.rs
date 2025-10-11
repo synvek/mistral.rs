@@ -5,7 +5,9 @@ use anyhow::Result;
 use candle_core::{DType, Device, Tensor};
 use serde::Deserialize;
 use tracing::info;
+#[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
+#[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Copy, Default, Debug, Deserialize, PartialEq)]
@@ -75,10 +77,10 @@ fn get_dtypes() -> Vec<DType> {
     // >= is supported
     const MIN_F16_CC: usize = 530;
 
-    let raw_out = Command::new("nvidia-smi")
-        //Synvek patch: Fix unexpected window for non-console application in windows
-        .creation_flags(CREATE_NO_WINDOW )
-        .arg("--query-gpu=compute_cap")
+    let  mut command = Command::new("nvidia-smi");
+    //Synvek patch: Fix unexpected window for non-console application in windows
+    command.creation_flags(CREATE_NO_WINDOW );
+    let raw_out = command.arg("--query-gpu=compute_cap")
         .arg("--format=csv")
         .output()
         .expect("Failed to run `nvidia-smi` but CUDA is selected.")
