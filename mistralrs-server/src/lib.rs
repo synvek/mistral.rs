@@ -255,7 +255,8 @@ pub struct HeartTickResponse {
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
-    pub main_process_port: String
+    pub main_process_port: String,
+    pub log_dir: PathBuf
 }
 
 fn parse_token_source(s: &str) -> Result<TokenSource, String> {
@@ -293,9 +294,10 @@ fn init_server_config(server_config: ServerConfig) -> Arc<Mutex<ServerConfig>> {
     Arc::new(Mutex::new(server_config))
 }
 
-pub fn initialize_server(model_dir: PathBuf, endpoint: String, port: String) {
+pub fn initialize_server(model_dir: PathBuf, endpoint: String, port: String, log_dir: PathBuf) {
     let server_config = ServerConfig {
         main_process_port: port,
+        log_dir,
     };
     GLOBAL_LOCKS.get_or_init(|| init_map());
     //let path = std::path::PathBuf::from("C:/source/works/huan/engine/models");
@@ -338,15 +340,16 @@ pub extern "C" fn stop_backend_server(task_id: *const c_char) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn init_backend_server(model_dir: *const c_char, endpoint: *const c_char, port: *const c_char) -> c_int {
+pub extern "C" fn init_backend_server(model_dir: *const c_char, endpoint: *const c_char, port: *const c_char, log_dir: *const c_char) -> c_int {
     if model_dir.is_null() || endpoint.is_null() {
         return ERROR_NULL_PTR;
     }
     let model_dir = Path::new(unsafe { CStr::from_ptr(model_dir).to_str().unwrap() });
     let endpoint = unsafe { CStr::from_ptr(endpoint).to_str().unwrap() };
     let port = unsafe { CStr::from_ptr(port).to_str().unwrap() };
+    let log_dir = Path::new(unsafe { CStr::from_ptr(log_dir).to_str().unwrap() });
+    initialize_server(model_dir.to_owned(), endpoint.to_owned(), port.to_owned(), log_dir.to_owned());
     initialize_logging();
-    initialize_server(model_dir.to_owned(), endpoint.to_owned(), port.to_owned());
     SUCCESS
 }
 
@@ -389,6 +392,8 @@ pub fn start_backend_server(
 }
 
 pub fn initialize_logging() {
+    let log_dir = get_log_dir();
+    println!("Logging directory: {}", log_dir.display());
     LOGGER.get_or_init(|| {
         let console_offset = time::UtcOffset::from_hms(8, 0, 0).unwrap();
         let console_timer = OffsetTime::new(
@@ -399,13 +404,12 @@ pub fn initialize_logging() {
             .with_timer(console_timer)
             .with_writer(std::io::stdout.with_max_level(tracing::Level::INFO));
 
-        // 2. 配置文件输出 + 按大小分割
         let file_appender = rolling::Builder::new()
             .rotation(Rotation::DAILY)
             .max_log_files(15)
             .filename_prefix("synvek_backend_default")
             .filename_suffix("log")
-            .build("./logs")
+            .build(log_dir)
             .expect("Failed to create file appender");
 
         let file_offset = time::UtcOffset::from_hms(8, 0, 0).unwrap();
@@ -467,6 +471,12 @@ pub fn get_server(task_id: String) -> Option<ModelInfo> {
     let map_ref = Arc::clone(GLOBAL_LOCKS.get().unwrap());
     let mut map = map_ref.lock().unwrap();
     map.get(&task_id).cloned()
+}
+
+pub fn get_log_dir() -> PathBuf {
+    let server_config = Arc::clone(GLOBAL_CONFIG.get().unwrap());
+    let server_config = server_config.lock().unwrap();
+    server_config.log_dir.clone()
 }
 
 pub fn get_main_process_port() -> String {
