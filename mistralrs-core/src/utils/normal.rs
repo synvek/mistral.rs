@@ -79,7 +79,9 @@ fn get_dtypes() -> Vec<DType> {
 
     let  mut command = Command::new("nvidia-smi");
     //Synvek patch: Fix unexpected window for non-console application in windows
+    #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW );
+
     let raw_out = command.arg("--query-gpu=compute_cap")
         .arg("--format=csv")
         .output()
